@@ -25,6 +25,17 @@ test_runs/
 **/test_runs/
 **/test_synth/run*/
 **/.mplcache/
+**/global_latents.csv
+**/global_latents.npy
+**/val_latents.csv
+**/metrics.jsonl
+**/run_summary.json
+**/gate_decision.json
+**/review_bundle.md
+**/pca_coords.csv
+**/umap_coords.csv
+**/tsne_coords.csv
+**/merged_latents_metadata.csv
 
 # Large model/data artifacts
 *.memmap
