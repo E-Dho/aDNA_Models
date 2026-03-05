@@ -1,0 +1,10 @@
+{
+  "memmap_path": "test_synth/toy.genotypes.int8.memmap",
+  "n_samples": 7,
+  "n_snps": 6,
+  "dtype": "int8",
+  "ploidy": "diploid",
+  "n_classes": 3,
+  "missing_value": -1,
+  "sample_ids_path": "test_synth/toy.sample_ids.txt"
+}

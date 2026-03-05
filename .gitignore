@@ -1,0 +1,38 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# OS/editor clutter
+.DS_Store
+.idea/
+.vscode/
+
+# Experiment tracking
+wandb/
+
+# Generated run artifacts
+runs/
+plots/
+test_runs/
+**/runs/
+**/plots/
+**/test_runs/
+**/test_synth/run*/
+**/.mplcache/
+
+# Large model/data artifacts
+*.memmap
+*.pt
+*.pth
+*.npy
+*.npz
+*.wandb
+
+# Logs
+*.log

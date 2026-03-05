@@ -1,0 +1,10 @@
+{
+  "memmap_path": "/Users/edo/Desktop/Hiwi/SNPTokenMaskedModel/test_synth/toy_token.genotypes.int8.memmap",
+  "n_samples": 7,
+  "n_snps": 6,
+  "dtype": "int8",
+  "ploidy": "diploid",
+  "n_classes": 3,
+  "missing_value": -1,
+  "sample_ids_path": "/Users/edo/Desktop/Hiwi/SNPTokenMaskedModel/test_synth/toy_token.sample_ids.txt"
+}
