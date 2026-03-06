@@ -64,6 +64,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb_group", default=None)
     p.add_argument("--wandb_tags", default=None, help="Comma-separated tags.")
     p.add_argument("--wandb_mode", choices=("offline", "online"), default="offline")
+
+    p.add_argument("--debug_mode", action="store_true", help="Enable verbose debug checks.")
+    p.add_argument(
+        "--debug_examples_per_batch",
+        type=int,
+        default=20,
+        help="How many masked-position examples to print for debug batches.",
+    )
+    p.add_argument(
+        "--debug_max_batches_per_phase",
+        type=int,
+        default=-1,
+        help="If >=0, only print per-batch debug counts for this many batches per phase.",
+    )
     return p
 
 
@@ -109,6 +123,9 @@ def main() -> None:
         wandb_group=args.wandb_group,
         wandb_tags=args.wandb_tags,
         wandb_mode=args.wandb_mode,
+        debug_mode=bool(args.debug_mode),
+        debug_examples_per_batch=args.debug_examples_per_batch,
+        debug_max_batches_per_phase=args.debug_max_batches_per_phase,
     )
     summary = run_training(cfg)
     print(json.dumps(summary, indent=2))

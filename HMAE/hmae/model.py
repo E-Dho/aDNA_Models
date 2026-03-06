@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -16,6 +17,11 @@ class HMAEConfig:
     global_latent_dim: int = 32
     embed_dim: int = 16
     local_hidden_dim: int = 128
+    local_encoder_type: str = "conv_attn"
+    local_conv_layers: int = 4
+    local_conv_kernel: int = 7
+    local_attn_heads: int = 4
+    local_dropout: float = 0.1
     global_model_dim: int = 128
     global_heads: int = 4
     global_layers: int = 2
@@ -24,7 +30,16 @@ class HMAEConfig:
     variational: bool = False
 
 
-class WindowEncoder(nn.Module):
+def _sanitize_padding_mask(mask: torch.Tensor) -> torch.Tensor:
+    # MultiheadAttention needs at least one unmasked token per row.
+    out = mask.clone()
+    all_masked = out.all(dim=1)
+    if all_masked.any():
+        out[all_masked, 0] = False
+    return out
+
+
+class MeanPoolWindowEncoder(nn.Module):
     def __init__(self, cfg: HMAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
@@ -56,6 +71,103 @@ class WindowEncoder(nn.Module):
         else:
             features = torch.cat([pooled, observed_frac], dim=1)
         return self.proj(features)
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, dropout: float) -> None:
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=padding)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.conv1(x)
+        y = F.gelu(y)
+        y = self.dropout(y)
+        y = self.conv2(y)
+        y = self.dropout(y)
+        return x + y
+
+
+class ConvAttnWindowEncoder(nn.Module):
+    def __init__(self, cfg: HMAEConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        if cfg.local_hidden_dim % cfg.local_attn_heads != 0:
+            raise ValueError(
+                "local_hidden_dim must be divisible by local_attn_heads "
+                f"({cfg.local_hidden_dim} vs {cfg.local_attn_heads})"
+            )
+        if cfg.local_conv_layers < 1:
+            raise ValueError("local_conv_layers must be >= 1")
+        if cfg.local_conv_kernel < 3 or cfg.local_conv_kernel % 2 == 0:
+            raise ValueError("local_conv_kernel must be an odd integer >= 3")
+
+        self.missing_token = cfg.n_classes
+        self.geno_embed = nn.Embedding(cfg.n_classes + 1, cfg.embed_dim)
+        self.token_proj = nn.Linear(cfg.embed_dim + 1, cfg.local_hidden_dim)
+        self.conv_blocks = nn.ModuleList(
+            [
+                ResidualConvBlock(
+                    channels=cfg.local_hidden_dim,
+                    kernel_size=cfg.local_conv_kernel,
+                    dropout=cfg.local_dropout,
+                )
+                for _ in range(cfg.local_conv_layers)
+            ]
+        )
+        self.token_norm = nn.LayerNorm(cfg.local_hidden_dim)
+        self.pool_query = nn.Parameter(torch.zeros(1, 1, cfg.local_hidden_dim))
+        self.pool_attn = nn.MultiheadAttention(
+            embed_dim=cfg.local_hidden_dim,
+            num_heads=cfg.local_attn_heads,
+            dropout=cfg.local_dropout,
+            batch_first=True,
+        )
+        context_dim = cfg.local_hidden_dim + (2 if cfg.include_window_coverage else 1)
+        self.context_proj = nn.Linear(context_dim, cfg.local_hidden_dim)
+        self.dropout = nn.Dropout(cfg.local_dropout)
+        self.out_proj = nn.Linear(cfg.local_hidden_dim, cfg.window_latent_dim)
+
+    def forward(
+        self,
+        input_idx: torch.Tensor,
+        obs_mask: torch.Tensor,
+        coverage: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # input_idx: [N, W], obs_mask: [N, W]
+        embed = self.geno_embed(input_idx)  # [N, W, E]
+        x = torch.cat([embed, obs_mask.unsqueeze(-1)], dim=-1)  # [N, W, E+1]
+        x = self.token_proj(x)
+        x = F.gelu(x)
+        x = self.dropout(x)
+
+        x = x.transpose(1, 2)  # [N, H, W]
+        for block in self.conv_blocks:
+            x = block(x)
+        tokens = x.transpose(1, 2)  # [N, W, H]
+        tokens = self.token_norm(tokens)
+
+        key_padding_mask = _sanitize_padding_mask(obs_mask <= 0.5)
+        query = self.pool_query.expand(tokens.shape[0], -1, -1)
+        pooled, _ = self.pool_attn(
+            query=query,
+            key=tokens,
+            value=tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        pooled = pooled.squeeze(1)  # [N, H]
+        observed_frac = obs_mask.mean(dim=1, keepdim=True)
+        if self.cfg.include_window_coverage and coverage is not None:
+            features = torch.cat([pooled, observed_frac, coverage], dim=1)
+        else:
+            features = torch.cat([pooled, observed_frac], dim=1)
+        h = self.context_proj(features)
+        h = F.silu(h)
+        h = self.dropout(h)
+        return self.out_proj(h)
 
 
 class GlobalAggregator(nn.Module):
@@ -144,7 +256,14 @@ class HierarchicalMaskedAutoencoder(nn.Module):
     def __init__(self, cfg: HMAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.window_encoder = WindowEncoder(cfg)
+        if cfg.local_encoder_type == "conv_attn":
+            self.window_encoder = ConvAttnWindowEncoder(cfg)
+        elif cfg.local_encoder_type == "meanpool":
+            self.window_encoder = MeanPoolWindowEncoder(cfg)
+        else:
+            raise ValueError(
+                "Unsupported local_encoder_type. Use one of: conv_attn, meanpool"
+            )
         self.global_agg = GlobalAggregator(cfg)
         self.decoder = WindowDecoder(cfg)
 
@@ -188,4 +307,3 @@ class HierarchicalMaskedAutoencoder(nn.Module):
             "mu": mu,
             "logvar": logvar,
         }
-

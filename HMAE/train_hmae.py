@@ -31,6 +31,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--learning_rate", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip_norm", type=float, default=1.0)
+    p.add_argument(
+        "--coverage_corr_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Penalty weight for squared Pearson correlation between global latent norm "
+            "and per-sample observed coverage in each training batch."
+        ),
+    )
     p.add_argument("--patience", type=int, default=5)
 
     p.add_argument("--mask_prob", type=float, default=0.2)
@@ -40,12 +49,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--global_latent_dim", type=int, default=32)
     p.add_argument("--embed_dim", type=int, default=16)
     p.add_argument("--local_hidden_dim", type=int, default=128)
+    p.add_argument(
+        "--local_encoder_type",
+        choices=("conv_attn", "meanpool"),
+        default="conv_attn",
+    )
+    p.add_argument("--local_conv_layers", type=int, default=4)
+    p.add_argument("--local_conv_kernel", type=int, default=7)
+    p.add_argument("--local_attn_heads", type=int, default=4)
+    p.add_argument("--local_dropout", type=float, default=0.1)
     p.add_argument("--global_model_dim", type=int, default=128)
     p.add_argument("--global_heads", type=int, default=4)
     p.add_argument("--global_layers", type=int, default=2)
     p.add_argument("--decoder_hidden_dim", type=int, default=128)
 
     p.add_argument("--include_window_coverage", action="store_true")
+    p.add_argument("--require_cuda", action="store_true")
+    p.add_argument("--amp", dest="amp", action="store_true")
+    p.add_argument("--no-amp", dest="amp", action="store_false")
+    p.set_defaults(amp=None)
     p.add_argument("--variational", action="store_true")
     p.add_argument("--kl_beta_max", type=float, default=1.0)
     p.add_argument("--kl_warmup_fraction", type=float, default=0.3)
@@ -86,6 +108,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
+        coverage_corr_weight=args.coverage_corr_weight,
         mask_prob=args.mask_prob,
         observed_dropout=args.observed_dropout,
         patience=args.patience,
@@ -96,11 +119,18 @@ def main() -> None:
         global_latent_dim=args.global_latent_dim,
         embed_dim=args.embed_dim,
         local_hidden_dim=args.local_hidden_dim,
+        local_encoder_type=args.local_encoder_type,
+        local_conv_layers=args.local_conv_layers,
+        local_conv_kernel=args.local_conv_kernel,
+        local_attn_heads=args.local_attn_heads,
+        local_dropout=args.local_dropout,
         global_model_dim=args.global_model_dim,
         global_heads=args.global_heads,
         global_layers=args.global_layers,
         decoder_hidden_dim=args.decoder_hidden_dim,
         include_window_coverage=bool(args.include_window_coverage),
+        require_cuda=bool(args.require_cuda),
+        amp=args.amp,
         embedding_batch_size=args.embedding_batch_size,
         embedding_window_chunk=args.embedding_window_chunk,
         coverage_monitor_subset=args.coverage_monitor_subset,

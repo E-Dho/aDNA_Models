@@ -4,7 +4,7 @@ This directory contains a scalable baseline for sparse aDNA dimensionality
 reduction with:
 
 - windowed SNP processing
-- shared local encoder across windows
+- configurable local encoder across windows (`conv_attn` or legacy `meanpool`)
 - masked denoising objective on observed SNPs
 - attention-based global aggregation over window latents
 - optional variational global latent
@@ -34,7 +34,7 @@ a single massive dense input layer.
 ### 1) Build memmap from EIGENSTRAT `.geno`
 
 ```bash
-cd /Users/edo/Desktop/Hiwi/HMAE
+cd /Users/edo/Desktop/Hiwi/aDNA_Models/HMAE
 python3 prepare_eigenstrat_memmap.py \
   --geno /path/to/data.geno \
   --ind /path/to/data.ind \
@@ -50,7 +50,7 @@ This produces:
 ### 2) Train deterministic baseline
 
 ```bash
-cd /Users/edo/Desktop/Hiwi/HMAE
+cd /Users/edo/Desktop/Hiwi/aDNA_Models/HMAE
 python3 train_hmae.py \
   --meta_json /path/to/output/aadr_unfiltered.meta.json \
   --output_dir /path/to/output/hmae_run \
@@ -58,6 +58,11 @@ python3 train_hmae.py \
   --windows_per_step 8 \
   --window_latent_dim 32 \
   --global_latent_dim 32 \
+  --local_encoder_type conv_attn \
+  --local_conv_layers 4 \
+  --local_conv_kernel 7 \
+  --local_attn_heads 4 \
+  --local_dropout 0.1 \
   --mask_prob 0.2 \
   --observed_dropout 0.1
 ```
@@ -65,7 +70,7 @@ python3 train_hmae.py \
 ### 2b) Train with offline W&B
 
 ```bash
-cd /Users/edo/Desktop/Hiwi/HMAE
+cd /Users/edo/Desktop/Hiwi/aDNA_Models/HMAE
 python3 train_hmae.py \
   --meta_json /path/to/output/aadr_unfiltered.meta.json \
   --output_dir /path/to/output/hmae_run \
@@ -74,6 +79,12 @@ python3 train_hmae.py \
   --wandb_project hmae-phase1 \
   --wandb_name hmae-baseline
 ```
+
+### 2c) GPU-first training flags
+
+- `--require_cuda`: fail early if CUDA is unavailable.
+- `--amp` / `--no-amp`: mixed precision override.
+  - Default behavior is automatic: AMP on CUDA, off on CPU.
 
 ### 3) Outputs
 
@@ -122,4 +133,6 @@ This writes:
 - This baseline uses cross-entropy reconstruction on intentionally masked
   observed SNPs only.
 - It uses random window sampling per step (not all windows at once).
+- `conv_attn` local encoder is the default for v2; use
+  `--local_encoder_type meanpool` for backward-compatible behavior.
 - Use `--variational` to enable a global VAE latent with KL term.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -67,6 +68,9 @@ class TrainConfig:
     wandb_group: Optional[str] = None
     wandb_tags: Optional[str] = None
     wandb_mode: str = "offline"
+    debug_mode: bool = False
+    debug_examples_per_batch: int = 20
+    debug_max_batches_per_phase: int = -1
 
 
 def _sample_rows(rng: np.random.Generator, pool: np.ndarray, size: int) -> np.ndarray:
@@ -74,30 +78,122 @@ def _sample_rows(rng: np.random.Generator, pool: np.ndarray, size: int) -> np.nd
     return pool[picks]
 
 
-def _masked_recon_ce(logits: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, int]:
-    n_classes = logits.shape[-1]
-    n_masked = int((targets != -100).sum().detach().cpu().item())
-    if n_masked == 0:
+def _build_valid_mask(targets: torch.Tensor, n_classes: int) -> torch.Tensor:
+    return (targets >= 0) & (targets < n_classes)
+
+
+def _masked_recon_ce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, int]:
+    n_used = int(valid_mask.sum().detach().cpu().item())
+    if n_used == 0:
         return logits.sum() * 0.0, 0
 
-    loss = F.cross_entropy(
-        logits.reshape(-1, n_classes),
-        targets.reshape(-1),
-        ignore_index=-100,
-        reduction="sum",
-    )
-    return loss / float(n_masked), n_masked
+    logits_flat = logits.reshape(-1, logits.shape[-1])
+    targets_flat = targets.reshape(-1)
+    valid_flat = valid_mask.reshape(-1)
+    loss = F.cross_entropy(logits_flat[valid_flat], targets_flat[valid_flat], reduction="sum")
+    return loss / float(n_used), n_used
 
 
-def _masked_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    valid = targets != -100
-    n = int(valid.sum().detach().cpu().item())
+def _masked_accuracy(logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor) -> float:
+    n = int(valid_mask.sum().detach().cpu().item())
     if n == 0:
         return float("nan")
 
     preds = logits.argmax(dim=-1)
-    correct = (preds[valid] == targets[valid]).float().mean()
+    correct = (preds[valid_mask] == targets[valid_mask]).float().mean()
     return float(correct.detach().cpu().item())
+
+
+def _debug_print_token_config(meta_n_classes: int, model: TokenSNPMaskedModel) -> None:
+    special = {
+        "pad_token_id": None,  # No explicit PAD token in input vocabulary.
+        "mask_token_id": model.mask_token,
+        "missing_token_id": model.missing_token,
+        "cls_token_id": None,
+        "bos_token_id": None,
+        "eos_token_id": None,
+    }
+    print(
+        "[DEBUG] token_config "
+        f"n_classes={meta_n_classes} vocab_size={model.vocab_size} specials={special}"
+    )
+
+
+def _debug_top_hist(counter: Counter, total: int, top_k: int = 20) -> str:
+    if total <= 0:
+        return "[]"
+    rows: List[str] = []
+    for token, count in counter.most_common(top_k):
+        pct = 100.0 * float(count) / float(total)
+        rows.append(f"{token}:{count} ({pct:.2f}%)")
+    return "[" + ", ".join(rows) + "]"
+
+
+def _counter_from_tensor(values: torch.Tensor) -> Counter:
+    c: Counter = Counter()
+    if values.numel() == 0:
+        return c
+    vals = values.detach().cpu().numpy().astype(np.int64, copy=False)
+    for v in vals.tolist():
+        c[int(v)] += 1
+    return c
+
+
+def _debug_print_masked_examples(
+    phase: str,
+    epoch: int,
+    step: int,
+    tokens: torch.Tensor,
+    train_mask: torch.Tensor,
+    targets: torch.Tensor,
+    logits: torch.Tensor,
+    mask_token_id: int,
+    missing_token_id: int,
+    n_examples: int,
+) -> None:
+    masked_positions = (train_mask > 0.5).nonzero(as_tuple=False)
+    if masked_positions.numel() == 0:
+        print(f"[DEBUG] {phase} epoch={epoch} step={step} no masked positions found")
+        return
+
+    probs = torch.softmax(logits, dim=-1)
+    n_take = min(n_examples, masked_positions.shape[0])
+    print(
+        f"[DEBUG] {phase} epoch={epoch} step={step} masked_examples="
+        f"{n_take}/{masked_positions.shape[0]}"
+    )
+    for i in range(n_take):
+        b = int(masked_positions[i, 0].item())
+        t = int(masked_positions[i, 1].item())
+        in_tok = int(tokens[b, t].item())
+        tgt_tok = int(targets[b, t].item())
+        pred_tok = int(logits[b, t].argmax().item())
+        tgt_prob = float(probs[b, t, tgt_tok].item()) if tgt_tok >= 0 else float("nan")
+        print(
+            "[DEBUG] masked_position "
+            f"phase={phase} epoch={epoch} step={step} b={b} t={t} "
+            f"input_token={in_tok} target_token={tgt_tok} predicted_token={pred_tok} "
+            f"target_prob={tgt_prob:.6f}"
+        )
+
+    masked_targets = targets[train_mask > 0.5]
+    invalid_special = (
+        (masked_targets == mask_token_id)
+        | (masked_targets == missing_token_id)
+        | (masked_targets < 0)
+    )
+    n_invalid = int(invalid_special.sum().detach().cpu().item())
+    n_masked = int(masked_targets.numel())
+    # Expect zero; tolerate <=1% to avoid stopping if data is partially corrupted.
+    max_allowed = max(0, int(0.01 * n_masked))
+    assert n_invalid <= max_allowed, (
+        f"Masked targets contain invalid specials: {n_invalid}/{n_masked}, "
+        f"mask_token={mask_token_id}, missing_token={missing_token_id}"
+    )
 
 
 def _pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
@@ -321,6 +417,49 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
     coverage_fraction = compute_observed_fraction(geno_mm)
     sample_ids = load_sample_ids(meta.sample_ids_path, meta.n_samples)
+
+    # Step 5: split leakage diagnostics.
+    train_set = set(splits["train"].tolist())
+    val_set = set(splits["val"].tolist())
+    test_set = set(splits["test"].tolist())
+    overlap_train_val = len(train_set & val_set)
+    overlap_train_test = len(train_set & test_set)
+    overlap_val_test = len(val_set & test_set)
+    if overlap_train_val != 0 or overlap_train_test != 0 or overlap_val_test != 0:
+        raise AssertionError(
+            "Split leakage detected: "
+            f"train/val={overlap_train_val}, train/test={overlap_train_test}, "
+            f"val/test={overlap_val_test}"
+        )
+
+    train_first100 = [sample_ids[int(i)] for i in splits["train"][:100]]
+    val_first100 = [sample_ids[int(i)] for i in splits["val"][:100]]
+    sample_overlap = len(set(train_first100) & set(val_first100))
+
+    print(
+        "[DEBUG] split_info "
+        f"seed={cfg.seed} n_samples={meta.n_samples} "
+        f"train={len(splits['train'])} val={len(splits['val'])} test={len(splits['test'])} "
+        f"overlap_train_val={overlap_train_val} overlap_train_test={overlap_train_test} "
+        f"overlap_val_test={overlap_val_test}"
+    )
+    print(
+        "[DEBUG] data_sources "
+        f"meta_json={cfg.meta_json} memmap_path={meta.memmap_path} "
+        f"sample_ids_path={meta.sample_ids_path} dtype={meta.dtype}"
+    )
+    print(f"[DEBUG] train_first100_sample_ids={train_first100}")
+    print(f"[DEBUG] val_first100_sample_ids={val_first100}")
+    print(f"[DEBUG] first100_sample_id_overlap={sample_overlap}")
+    assert sample_overlap == 0, f"Unexpected overlap among first100 train/val IDs: {sample_overlap}"
+
+    _debug_print_token_config(meta_n_classes=meta.n_classes, model=model)
+    print(
+        "[DEBUG] ce_scaling "
+        "CrossEntropy is computed with reduction='sum' over valid masked targets "
+        "then divided by n_used_for_loss; train and val use the same code path."
+    )
+
     batch_labels = None
     if cfg.batch_labels_tsv is not None:
         batch_labels = _load_batch_labels(Path(cfg.batch_labels_tsv), sample_ids)
@@ -330,6 +469,17 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     epochs_without_improvement = 0
 
     history: List[Dict[str, float]] = []
+    fixed_monitor_ids: Optional[np.ndarray] = None
+    if cfg.monitor_every > 0:
+        monitor_pool = np.concatenate([splits["train"], splits["val"], splits["test"]])
+        monitor_k = min(cfg.coverage_monitor_subset, len(monitor_pool))
+        rng_monitor = np.random.default_rng(cfg.seed + 7_777)
+        fixed_monitor_ids = rng_monitor.choice(monitor_pool, size=monitor_k, replace=False)
+        print(
+            "[DEBUG] monitor_subset "
+            f"mode=fixed seed={cfg.seed + 7777} size={monitor_k} "
+            f"preview={fixed_monitor_ids[:20].tolist()}"
+        )
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
@@ -337,8 +487,12 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         train_masked = 0
         train_acc_sum = 0.0
         train_acc_count = 0
+        train_eligible_total = 0
+        train_masked_total = 0
+        train_hist: Counter = Counter()
+        printed_train_examples = False
 
-        for _ in range(cfg.steps_per_epoch):
+        for step_idx in range(cfg.steps_per_epoch):
             batch_idx = _sample_rows(rng, splits["train"], cfg.batch_size)
             batch = build_random_window_batch(
                 geno_mm=geno_mm,
@@ -359,7 +513,28 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 obs_mask=batch["obs_mask"],
                 snp_idx=batch["snp_idx"] if cfg.use_snp_id_embedding else None,
             )
-            loss, n_masked = _masked_recon_ce(out["logits"], batch["targets"])
+
+            valid_mask = _build_valid_mask(batch["targets"], meta.n_classes)
+            n_total_tokens = int(batch["tokens"].numel())
+            n_eligible_maskable = int((batch["eligible_mask"] > 0.5).sum().detach().cpu().item())
+            n_masked_positions = int((batch["train_mask"] > 0.5).sum().detach().cpu().item())
+            loss, n_used_for_loss = _masked_recon_ce(out["logits"], batch["targets"], valid_mask)
+
+            if cfg.debug_mode and (
+                cfg.debug_max_batches_per_phase < 0 or step_idx < cfg.debug_max_batches_per_phase
+            ):
+                print(
+                    "[DEBUG] batch_counts "
+                    f"phase=train epoch={epoch} step={step_idx+1}/{cfg.steps_per_epoch} "
+                    f"n_total_tokens={n_total_tokens} n_eligible_maskable={n_eligible_maskable} "
+                    f"n_masked_positions={n_masked_positions} n_used_for_loss={n_used_for_loss}"
+                )
+
+            assert n_used_for_loss == n_masked_positions, (
+                "n_used_for_loss != n_masked_positions after filtering; "
+                f"used={n_used_for_loss}, masked={n_masked_positions}. "
+                "If this fires, masked targets may contain invalid/special token IDs."
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -367,25 +542,48 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
             optimizer.step()
 
-            train_loss_sum += float(loss.detach().cpu().item()) * n_masked
-            train_masked += n_masked
+            train_loss_sum += float(loss.detach().cpu().item()) * n_used_for_loss
+            train_masked += n_used_for_loss
+            train_eligible_total += n_eligible_maskable
+            train_masked_total += n_masked_positions
+            train_hist.update(_counter_from_tensor(batch["targets"][batch["train_mask"] > 0.5]))
 
-            acc = _masked_accuracy(out["logits"], batch["targets"])
+            acc = _masked_accuracy(out["logits"], batch["targets"], valid_mask)
             if not np.isnan(acc):
                 train_acc_sum += acc
                 train_acc_count += 1
 
+            if cfg.debug_mode and not printed_train_examples:
+                _debug_print_masked_examples(
+                    phase="train",
+                    epoch=epoch,
+                    step=step_idx + 1,
+                    tokens=batch["tokens"],
+                    train_mask=batch["train_mask"],
+                    targets=batch["targets"],
+                    logits=out["logits"],
+                    mask_token_id=model.mask_token,
+                    missing_token_id=model.missing_token,
+                    n_examples=cfg.debug_examples_per_batch,
+                )
+                printed_train_examples = True
+
         train_ce = train_loss_sum / float(max(1, train_masked))
         train_acc = train_acc_sum / float(max(1, train_acc_count))
+        train_masked_rate = float(train_masked_total) / float(max(1, train_eligible_total))
 
         model.eval()
         val_loss_sum = 0.0
         val_masked = 0
         val_acc_sum = 0.0
         val_acc_count = 0
+        val_eligible_total = 0
+        val_masked_total = 0
+        val_hist: Counter = Counter()
+        printed_val_examples = False
 
         with torch.no_grad():
-            for _ in range(cfg.val_steps):
+            for step_idx in range(cfg.val_steps):
                 batch_idx = _sample_rows(rng, splits["val"], cfg.batch_size)
                 batch = build_random_window_batch(
                     geno_mm=geno_mm,
@@ -406,25 +604,83 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                     obs_mask=batch["obs_mask"],
                     snp_idx=batch["snp_idx"] if cfg.use_snp_id_embedding else None,
                 )
-                loss, n_masked = _masked_recon_ce(out["logits"], batch["targets"])
+                valid_mask = _build_valid_mask(batch["targets"], meta.n_classes)
+                n_total_tokens = int(batch["tokens"].numel())
+                n_eligible_maskable = int((batch["eligible_mask"] > 0.5).sum().detach().cpu().item())
+                n_masked_positions = int((batch["train_mask"] > 0.5).sum().detach().cpu().item())
+                loss, n_used_for_loss = _masked_recon_ce(out["logits"], batch["targets"], valid_mask)
 
-                val_loss_sum += float(loss.detach().cpu().item()) * n_masked
-                val_masked += n_masked
+                if cfg.debug_mode and (
+                    cfg.debug_max_batches_per_phase < 0 or step_idx < cfg.debug_max_batches_per_phase
+                ):
+                    print(
+                        "[DEBUG] batch_counts "
+                        f"phase=val epoch={epoch} step={step_idx+1}/{cfg.val_steps} "
+                        f"n_total_tokens={n_total_tokens} n_eligible_maskable={n_eligible_maskable} "
+                        f"n_masked_positions={n_masked_positions} n_used_for_loss={n_used_for_loss}"
+                    )
 
-                acc = _masked_accuracy(out["logits"], batch["targets"])
+                assert n_used_for_loss == n_masked_positions, (
+                    "n_used_for_loss != n_masked_positions after filtering (val); "
+                    f"used={n_used_for_loss}, masked={n_masked_positions}"
+                )
+
+                val_loss_sum += float(loss.detach().cpu().item()) * n_used_for_loss
+                val_masked += n_used_for_loss
+                val_eligible_total += n_eligible_maskable
+                val_masked_total += n_masked_positions
+                val_hist.update(_counter_from_tensor(batch["targets"][batch["train_mask"] > 0.5]))
+
+                acc = _masked_accuracy(out["logits"], batch["targets"], valid_mask)
                 if not np.isnan(acc):
                     val_acc_sum += acc
                     val_acc_count += 1
 
+                if cfg.debug_mode and not printed_val_examples:
+                    _debug_print_masked_examples(
+                        phase="val",
+                        epoch=epoch,
+                        step=step_idx + 1,
+                        tokens=batch["tokens"],
+                        train_mask=batch["train_mask"],
+                        targets=batch["targets"],
+                        logits=out["logits"],
+                        mask_token_id=model.mask_token,
+                        missing_token_id=model.missing_token,
+                        n_examples=cfg.debug_examples_per_batch,
+                    )
+                    printed_val_examples = True
+
         val_ce = val_loss_sum / float(max(1, val_masked))
         val_acc = val_acc_sum / float(max(1, val_acc_count))
+        val_masked_rate = float(val_masked_total) / float(max(1, val_eligible_total))
+
+        if cfg.debug_mode:
+            train_hist_total = sum(train_hist.values())
+            val_hist_total = sum(val_hist.values())
+            print(
+                "[DEBUG] target_hist "
+                f"phase=train epoch={epoch} total_masked_targets={train_hist_total} "
+                f"top20={_debug_top_hist(train_hist, train_hist_total, top_k=20)}"
+            )
+            print(
+                "[DEBUG] target_hist "
+                f"phase=val epoch={epoch} total_masked_targets={val_hist_total} "
+                f"top20={_debug_top_hist(val_hist, val_hist_total, top_k=20)}"
+            )
+            print(
+                "[DEBUG] masked_rate "
+                f"epoch={epoch} train_masked_rate={train_masked_rate:.6f} "
+                f"val_masked_rate={val_masked_rate:.6f} "
+                f"train_masked={train_masked_total}/{max(1, train_eligible_total)} "
+                f"val_masked={val_masked_total}/{max(1, val_eligible_total)}"
+            )
 
         cov_corr = float("nan")
         batch_r2 = float("nan")
         if cfg.monitor_every > 0 and (epoch % cfg.monitor_every == 0):
-            monitor_pool = np.concatenate([splits["train"], splits["val"], splits["test"]])
-            monitor_k = min(cfg.coverage_monitor_subset, len(monitor_pool))
-            monitor_ids = rng.choice(monitor_pool, size=monitor_k, replace=False)
+            assert fixed_monitor_ids is not None
+            monitor_ids = fixed_monitor_ids
 
             lat = _encode_sample_embeddings(
                 model=model,
@@ -434,7 +690,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 n_classes=meta.n_classes,
                 n_snps=meta.n_snps,
                 device=device,
-                seed=cfg.seed + epoch,
+                # Keep embedding windows fixed across epochs for comparable confound monitoring.
+                seed=cfg.seed + 8_888,
             )
             lat_norm = np.linalg.norm(lat, axis=1)
             cov_corr = _pearson_corr(lat_norm, coverage_fraction[monitor_ids])
@@ -449,6 +706,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "val_masked_acc": float(val_acc),
             "train_masked_tokens": float(train_masked),
             "val_masked_tokens": float(val_masked),
+            "train_masked_rate": float(train_masked_rate),
+            "val_masked_rate": float(val_masked_rate),
             "coverage_latent_norm_corr": float(cov_corr),
             "batch_latent_norm_r2": float(batch_r2),
         }

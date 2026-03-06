@@ -277,6 +277,7 @@ def build_random_window_batch(
     tokens = np.full((bsz, windows_per_sample, window_size), missing_token, dtype=np.int64)
     genotypes = np.full((bsz, windows_per_sample, window_size), MISSING_VALUE, dtype=np.int16)
     obs_mask = np.zeros((bsz, windows_per_sample, window_size), dtype=np.float32)
+    eligible_mask = np.zeros((bsz, windows_per_sample, window_size), dtype=np.float32)
     train_mask = np.zeros((bsz, windows_per_sample, window_size), dtype=np.float32)
     snp_idx = np.zeros((bsz, windows_per_sample, window_size), dtype=np.int64)
 
@@ -296,6 +297,7 @@ def build_random_window_batch(
                 token_view[observed] = block[observed].astype(np.int64)
                 geno_view[observed] = block[observed]
                 obs_view[:] = observed.astype(np.float32)
+                eligible_mask[bi, wi, :wlen] = observed.astype(np.float32)
                 snp_view[:] = start + np.arange(wlen, dtype=np.int64)
 
     if apply_mask:
@@ -329,6 +331,10 @@ def build_random_window_batch(
             dtype=torch.long,
         ),
         "obs_mask": torch.from_numpy(obs_mask.reshape(n_seq, window_size)).to(
+            device=device,
+            dtype=torch.float32,
+        ),
+        "eligible_mask": torch.from_numpy(eligible_mask.reshape(n_seq, window_size)).to(
             device=device,
             dtype=torch.float32,
         ),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -44,6 +45,7 @@ class TrainConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
     grad_clip_norm: float = 1.0
+    coverage_corr_weight: float = 0.0
     mask_prob: float = 0.2
     observed_dropout: float = 0.1
     patience: int = 5
@@ -54,14 +56,21 @@ class TrainConfig:
     global_latent_dim: int = 32
     embed_dim: int = 16
     local_hidden_dim: int = 128
+    local_encoder_type: str = "conv_attn"
+    local_conv_layers: int = 4
+    local_conv_kernel: int = 7
+    local_attn_heads: int = 4
+    local_dropout: float = 0.1
     global_model_dim: int = 128
     global_heads: int = 4
     global_layers: int = 2
     decoder_hidden_dim: int = 128
     include_window_coverage: bool = True
-    embedding_batch_size: int = 128
-    embedding_window_chunk: int = 16
-    coverage_monitor_subset: int = 512
+    require_cuda: bool = False
+    amp: Optional[bool] = None
+    embedding_batch_size: int = 16
+    embedding_window_chunk: int = 4
+    coverage_monitor_subset: int = 128
     monitor_every: int = 1
     batch_labels_tsv: Optional[str] = None
     wandb_enable: bool = False
@@ -90,6 +99,35 @@ def _kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
 def _beta_at_epoch(epoch: int, epochs: int, beta_max: float, warmup_fraction: float) -> float:
     warmup_epochs = max(1, int(math.ceil(epochs * warmup_fraction)))
     return float(beta_max * min(1.0, epoch / float(warmup_epochs)))
+
+
+def _autocast_context(device: torch.device, amp_enabled: bool):
+    if amp_enabled and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+
+def _is_cuda_oom(exc: RuntimeError, device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda out of memory" in msg
+
+
+def _squared_pearson_corr_torch(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if x.numel() < 2 or y.numel() < 2:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+    x_centered = x - x.mean()
+    y_centered = y - y.mean()
+    denom = torch.sqrt(
+        torch.sum(x_centered * x_centered) * torch.sum(y_centered * y_centered) + eps
+    )
+    corr = torch.sum(x_centered * y_centered) / denom
+    return corr * corr
 
 
 def _masked_recon_ce(logits: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, int]:
@@ -203,6 +241,7 @@ def _encode_global_for_indices(
     cfg: TrainConfig,
     n_classes: int,
     device: torch.device,
+    amp_enabled: bool,
 ) -> np.ndarray:
     model.eval()
 
@@ -211,40 +250,76 @@ def _encode_global_for_indices(
 
     result = np.zeros((len(indices), model.cfg.global_latent_dim), dtype=np.float32)
 
+    current_bs = max(1, int(cfg.embedding_batch_size))
+    current_wc = max(1, int(cfg.embedding_window_chunk))
     write_ptr = 0
+    start = 0
     dummy_rng = np.random.default_rng(cfg.seed)
-    for start in range(0, len(indices), cfg.embedding_batch_size):
-        end = min(start + cfg.embedding_batch_size, len(indices))
-        batch_idx = indices[start:end]
 
-        lat_chunks: List[torch.Tensor] = []
-        for w_start in range(0, len(windows), cfg.embedding_window_chunk):
-            w_end = min(w_start + cfg.embedding_window_chunk, len(windows))
-            wids = all_window_ids[w_start:w_end]
-            batch = build_window_batch(
-                geno_mm=geno_mm,
-                sample_indices=batch_idx,
-                windows=windows,
-                window_ids=wids,
-                window_size=cfg.window_size,
-                n_classes=n_classes,
-                rng=dummy_rng,
-                mask_prob=0.0,
-                observed_dropout=0.0,
-                training=False,
-                device=device,
-            )
-            win_lat = model.encode_windows(
-                input_idx=batch["input_idx"],
-                obs_mask=batch["obs_mask"],
-                coverage=batch["coverage"] if cfg.include_window_coverage else None,
-            )
-            lat_chunks.append(win_lat)
+    while start < len(indices):
+        batch_success = False
+        while not batch_success:
+            bs = min(current_bs, len(indices) - start)
+            end = start + bs
+            batch_idx = indices[start:end]
+            lat_chunks: List[torch.Tensor] = []
+            try:
+                for w_start in range(0, len(windows), current_wc):
+                    w_end = min(w_start + current_wc, len(windows))
+                    wids = all_window_ids[w_start:w_end]
+                    batch = build_window_batch(
+                        geno_mm=geno_mm,
+                        sample_indices=batch_idx,
+                        windows=windows,
+                        window_ids=wids,
+                        window_size=cfg.window_size,
+                        n_classes=n_classes,
+                        rng=dummy_rng,
+                        mask_prob=0.0,
+                        observed_dropout=0.0,
+                        training=False,
+                        device=device,
+                    )
+                    with _autocast_context(device=device, amp_enabled=amp_enabled):
+                        win_lat = model.encode_windows(
+                            input_idx=batch["input_idx"],
+                            obs_mask=batch["obs_mask"],
+                            coverage=batch["coverage"] if cfg.include_window_coverage else None,
+                        )
+                    lat_chunks.append(win_lat)
 
-        all_win_lat = torch.cat(lat_chunks, dim=1)
-        z, _, _ = model.aggregate(all_win_lat, all_window_ids_t)
-        result[write_ptr : write_ptr + (end - start)] = z.detach().cpu().numpy()
-        write_ptr += end - start
+                with _autocast_context(device=device, amp_enabled=amp_enabled):
+                    all_win_lat = torch.cat(lat_chunks, dim=1)
+                    z, _, _ = model.aggregate(all_win_lat, all_window_ids_t)
+                result[write_ptr : write_ptr + bs] = z.detach().cpu().numpy()
+                write_ptr += bs
+                start += bs
+                batch_success = True
+            except RuntimeError as exc:
+                if not _is_cuda_oom(exc, device):
+                    raise
+                # Back off window chunk first, then sample batch size.
+                if current_wc > 1:
+                    current_wc = max(1, current_wc // 2)
+                elif current_bs > 1:
+                    current_bs = max(1, current_bs // 2)
+                else:
+                    raise RuntimeError(
+                        "CUDA OOM during latent encoding even at "
+                        "embedding_batch_size=1 and embedding_window_chunk=1."
+                    ) from exc
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                print(
+                    f"[hmae] CUDA OOM in embedding path; retrying with "
+                    f"embedding_batch_size={current_bs}, "
+                    f"embedding_window_chunk={current_wc}"
+                )
+            finally:
+                for t in lat_chunks:
+                    del t
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
     return result
 
@@ -294,7 +369,15 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     if cfg.batch_labels_tsv:
         batch_ids = _load_batch_labels(Path(cfg.batch_labels_tsv), sample_ids)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cuda_available = torch.cuda.is_available()
+    if cfg.require_cuda and not cuda_available:
+        raise RuntimeError(
+            "CUDA is required (--require_cuda) but no CUDA device is available."
+        )
+    device = torch.device("cuda" if cuda_available else "cpu")
+    amp_enabled = bool(cfg.amp) if cfg.amp is not None else (device.type == "cuda")
+    if amp_enabled and device.type != "cuda":
+        amp_enabled = False
 
     model_cfg = HMAEConfig(
         n_classes=meta.n_classes,
@@ -304,6 +387,11 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         global_latent_dim=cfg.global_latent_dim,
         embed_dim=cfg.embed_dim,
         local_hidden_dim=cfg.local_hidden_dim,
+        local_encoder_type=cfg.local_encoder_type,
+        local_conv_layers=cfg.local_conv_layers,
+        local_conv_kernel=cfg.local_conv_kernel,
+        local_attn_heads=cfg.local_attn_heads,
+        local_dropout=cfg.local_dropout,
         global_model_dim=cfg.global_model_dim,
         global_heads=cfg.global_heads,
         global_layers=cfg.global_layers,
@@ -312,6 +400,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         variational=cfg.variational,
     )
     model = HierarchicalMaskedAutoencoder(model_cfg).to(device)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=cfg.learning_rate,
@@ -339,6 +428,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 "n_snps": meta.n_snps,
                 "n_windows": len(windows),
                 "device": str(device),
+                "amp_enabled": bool(amp_enabled),
             },
         )
 
@@ -358,6 +448,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
         train_recon_vals: List[float] = []
         train_kl_vals: List[float] = []
+        train_cov_pen_vals: List[float] = []
         train_total_vals: List[float] = []
 
         for _step in range(cfg.steps_per_epoch):
@@ -377,35 +468,50 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 device=device,
             )
 
-            optimizer.zero_grad()
-            out = model(
-                input_idx=batch["input_idx"],
-                obs_mask=batch["obs_mask"],
-                window_ids=batch["window_ids"],
-                coverage=batch["coverage"] if cfg.include_window_coverage else None,
-            )
+            optimizer.zero_grad(set_to_none=True)
+            with _autocast_context(device=device, amp_enabled=amp_enabled):
+                out = model(
+                    input_idx=batch["input_idx"],
+                    obs_mask=batch["obs_mask"],
+                    window_ids=batch["window_ids"],
+                    coverage=batch["coverage"] if cfg.include_window_coverage else None,
+                )
 
-            recon_loss, n_masked = _masked_recon_ce(out["logits"], batch["targets"])
-            if n_masked == 0:
-                continue
+                recon_loss, n_masked = _masked_recon_ce(out["logits"], batch["targets"])
+                if n_masked == 0:
+                    continue
 
-            if cfg.variational:
-                if out["mu"] is None or out["logvar"] is None:
-                    raise RuntimeError("Variational mode enabled but mu/logvar missing.")
-                kl = _kl_loss(out["mu"], out["logvar"])
-            else:
-                kl = torch.zeros((), device=device)
-
-            total = recon_loss + beta * kl
+                if cfg.variational:
+                    if out["mu"] is None or out["logvar"] is None:
+                        raise RuntimeError("Variational mode enabled but mu/logvar missing.")
+                    kl = _kl_loss(out["mu"], out["logvar"])
+                else:
+                    kl = torch.zeros((), device=device)
+                cov_pen = torch.zeros((), device=device)
+                if cfg.coverage_corr_weight > 0:
+                    z_norm = torch.linalg.vector_norm(out["global_latent"], ord=2, dim=1)
+                    cov_signal = batch["coverage"].squeeze(-1).mean(dim=1)
+                    cov_pen = _squared_pearson_corr_torch(z_norm, cov_signal)
+                total = recon_loss + beta * kl + cfg.coverage_corr_weight * cov_pen
             if torch.isnan(total):
                 raise RuntimeError("NaN loss encountered.")
 
-            total.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
-            optimizer.step()
+            if scaler.is_enabled():
+                scaler.scale(total).backward()
+                if cfg.grad_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                total.backward()
+                if cfg.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+                optimizer.step()
 
             train_recon_vals.append(float(recon_loss.detach().cpu().item()))
             train_kl_vals.append(float(kl.detach().cpu().item()))
+            train_cov_pen_vals.append(float(cov_pen.detach().cpu().item()))
             train_total_vals.append(float(total.detach().cpu().item()))
 
         model.eval()
@@ -429,13 +535,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                     training=True,
                     device=device,
                 )
-                out = model(
-                    input_idx=batch["input_idx"],
-                    obs_mask=batch["obs_mask"],
-                    window_ids=batch["window_ids"],
-                    coverage=batch["coverage"] if cfg.include_window_coverage else None,
-                )
-                recon_loss, n_masked = _masked_recon_ce(out["logits"], batch["targets"])
+                with _autocast_context(device=device, amp_enabled=amp_enabled):
+                    out = model(
+                        input_idx=batch["input_idx"],
+                        obs_mask=batch["obs_mask"],
+                        window_ids=batch["window_ids"],
+                        coverage=batch["coverage"] if cfg.include_window_coverage else None,
+                    )
+                    recon_loss, n_masked = _masked_recon_ce(out["logits"], batch["targets"])
                 if n_masked == 0:
                     continue
                 if cfg.variational:
@@ -454,6 +561,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "beta": beta,
             "train_recon": float(np.mean(train_recon_vals)) if train_recon_vals else float("nan"),
             "train_kl": float(np.mean(train_kl_vals)) if train_kl_vals else float("nan"),
+            "train_cov_corr_penalty": (
+                float(np.mean(train_cov_pen_vals)) if train_cov_pen_vals else float("nan")
+            ),
             "train_total": float(np.mean(train_total_vals)) if train_total_vals else float("nan"),
             "val_recon": float(np.mean(val_recon_vals)) if val_recon_vals else float("nan"),
             "val_kl": float(np.mean(val_kl_vals)) if val_kl_vals else float("nan"),
@@ -472,6 +582,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 cfg=cfg,
                 n_classes=meta.n_classes,
                 device=device,
+                amp_enabled=amp_enabled,
             )
             z_norm = np.linalg.norm(z_subset, axis=1)
             cov_corr = _pearson_corr(z_norm, observed_fraction[subset])
@@ -519,6 +630,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         cfg=cfg,
         n_classes=meta.n_classes,
         device=device,
+        amp_enabled=amp_enabled,
     )
     np.save(out_dir / "global_latents.npy", global_latents)
 
@@ -537,6 +649,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         "n_windows": len(windows),
         "n_classes": meta.n_classes,
         "device": str(device),
+        "amp_enabled": bool(amp_enabled),
         "model_cfg": asdict(model_cfg),
         "train_cfg": asdict(cfg),
         "wandb": {
