@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import socket
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -61,10 +62,12 @@ class TrainConfig:
     local_conv_kernel: int = 7
     local_attn_heads: int = 4
     local_dropout: float = 0.1
+    window_latent_slots: int = 4
     global_model_dim: int = 128
     global_heads: int = 4
     global_layers: int = 2
     decoder_hidden_dim: int = 128
+    decoder_attn_heads: int = 4
     include_window_coverage: bool = True
     require_cuda: bool = False
     amp: Optional[bool] = None
@@ -80,6 +83,9 @@ class TrainConfig:
     wandb_group: Optional[str] = None
     wandb_tags: Optional[str] = None
     wandb_mode: str = "offline"
+    wandb_log_every: int = 2
+    wandb_online_fallback: bool = True
+    wandb_init_timeout: int = 60
 
 
 def _sample_rows(rng: np.random.Generator, pool: np.ndarray, size: int) -> np.ndarray:
@@ -169,6 +175,14 @@ def _parse_wandb_tags(raw_tags: Optional[str]) -> Optional[List[str]]:
     return tags if tags else None
 
 
+def _wandb_online_reachable(timeout_seconds: float) -> bool:
+    try:
+        with socket.create_connection(("api.wandb.ai", 443), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
 def _load_batch_labels(path: Path, sample_ids: Sequence[str]) -> np.ndarray:
     sample_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
     raw_labels = np.full(len(sample_ids), -1, dtype=np.int64)
@@ -246,7 +260,6 @@ def _encode_global_for_indices(
     model.eval()
 
     all_window_ids = np.arange(len(windows), dtype=np.int64)
-    all_window_ids_t = torch.from_numpy(all_window_ids).to(device=device, dtype=torch.long)
 
     result = np.zeros((len(indices), model.cfg.global_latent_dim), dtype=np.float32)
 
@@ -262,7 +275,9 @@ def _encode_global_for_indices(
             bs = min(current_bs, len(indices) - start)
             end = start + bs
             batch_idx = indices[start:end]
-            lat_chunks: List[torch.Tensor] = []
+            agg_lat_chunks: List[torch.Tensor] = []
+            agg_window_id_chunks: List[torch.Tensor] = []
+            agg_slot_id_chunks: List[torch.Tensor] = []
             try:
                 for w_start in range(0, len(windows), current_wc):
                     w_end = min(w_start + current_wc, len(windows))
@@ -281,16 +296,30 @@ def _encode_global_for_indices(
                         device=device,
                     )
                     with _autocast_context(device=device, amp_enabled=amp_enabled):
-                        win_lat = model.encode_windows(
+                        encoded = model.encode_windows(
                             input_idx=batch["input_idx"],
                             obs_mask=batch["obs_mask"],
                             coverage=batch["coverage"] if cfg.include_window_coverage else None,
+                            window_ids=batch["window_ids"],
                         )
-                    lat_chunks.append(win_lat)
+                    agg_lat_chunks.append(encoded["agg_window_latents"])
+                    agg_window_id_chunks.append(encoded["agg_window_ids"])
+                    if encoded["agg_slot_ids"] is not None:
+                        agg_slot_id_chunks.append(encoded["agg_slot_ids"])
 
                 with _autocast_context(device=device, amp_enabled=amp_enabled):
-                    all_win_lat = torch.cat(lat_chunks, dim=1)
-                    z, _, _ = model.aggregate(all_win_lat, all_window_ids_t)
+                    all_agg_win_lat = torch.cat(agg_lat_chunks, dim=1)
+                    all_agg_window_ids = torch.cat(agg_window_id_chunks, dim=0)
+                    all_agg_slot_ids = (
+                        torch.cat(agg_slot_id_chunks, dim=0)
+                        if agg_slot_id_chunks
+                        else None
+                    )
+                    z, _, _ = model.aggregate(
+                        window_latents=all_agg_win_lat,
+                        window_ids=all_agg_window_ids,
+                        slot_ids=all_agg_slot_ids,
+                    )
                 result[write_ptr : write_ptr + bs] = z.detach().cpu().numpy()
                 write_ptr += bs
                 start += bs
@@ -316,7 +345,11 @@ def _encode_global_for_indices(
                     f"embedding_window_chunk={current_wc}"
                 )
             finally:
-                for t in lat_chunks:
+                for t in agg_lat_chunks:
+                    del t
+                for t in agg_window_id_chunks:
+                    del t
+                for t in agg_slot_id_chunks:
                     del t
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
@@ -392,10 +425,12 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         local_conv_kernel=cfg.local_conv_kernel,
         local_attn_heads=cfg.local_attn_heads,
         local_dropout=cfg.local_dropout,
+        window_latent_slots=cfg.window_latent_slots,
         global_model_dim=cfg.global_model_dim,
         global_heads=cfg.global_heads,
         global_layers=cfg.global_layers,
         decoder_hidden_dim=cfg.decoder_hidden_dim,
+        decoder_attn_heads=cfg.decoder_attn_heads,
         include_window_coverage=cfg.include_window_coverage,
         variational=cfg.variational,
     )
@@ -407,21 +442,33 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         weight_decay=cfg.weight_decay,
     )
     wandb_run = None
+    wandb_log_enabled = False
+    wandb_mode_effective: Optional[str] = None
     if cfg.wandb_enable:
         if wandb is None:
             raise RuntimeError(
                 "W&B requested but wandb package is not installed. "
                 "Install with: pip install wandb"
             )
-        wandb_run = wandb.init(
-            project=cfg.wandb_project,
-            entity=cfg.wandb_entity,
-            name=cfg.wandb_name or Path(cfg.output_dir).name,
-            group=cfg.wandb_group,
-            tags=_parse_wandb_tags(cfg.wandb_tags),
-            mode=cfg.wandb_mode,
-            dir=str(out_dir),
-            config={
+        requested_wandb_mode = cfg.wandb_mode
+        if requested_wandb_mode == "online" and cfg.wandb_online_fallback:
+            probe_timeout = float(max(1, min(10, int(cfg.wandb_init_timeout))))
+            if not _wandb_online_reachable(timeout_seconds=probe_timeout):
+                print(
+                    "[hmae] W&B online endpoint unreachable from this node. "
+                    "Falling back to offline mode."
+                )
+                requested_wandb_mode = "offline"
+
+        init_kwargs = {
+            "project": cfg.wandb_project,
+            "entity": cfg.wandb_entity,
+            "name": cfg.wandb_name or Path(cfg.output_dir).name,
+            "group": cfg.wandb_group,
+            "tags": _parse_wandb_tags(cfg.wandb_tags),
+            "dir": str(out_dir),
+            "settings": wandb.Settings(init_timeout=max(1, int(cfg.wandb_init_timeout))),
+            "config": {
                 "train_cfg": asdict(cfg),
                 "model_cfg": asdict(model_cfg),
                 "n_samples": meta.n_samples,
@@ -430,7 +477,31 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 "device": str(device),
                 "amp_enabled": bool(amp_enabled),
             },
-        )
+        }
+        try:
+            wandb_run = wandb.init(mode=requested_wandb_mode, **init_kwargs)
+            wandb_mode_effective = requested_wandb_mode
+            wandb_log_enabled = True
+        except Exception as exc:
+            if requested_wandb_mode == "online" and cfg.wandb_online_fallback:
+                print(
+                    f"[hmae] W&B online init failed ({exc}). "
+                    "Retrying once with offline mode."
+                )
+                try:
+                    wandb_run = wandb.init(mode="offline", **init_kwargs)
+                    wandb_mode_effective = "offline"
+                    wandb_log_enabled = True
+                except Exception as fallback_exc:
+                    print(
+                        f"[hmae] W&B offline fallback failed ({fallback_exc}). "
+                        "Disabling W&B for this run."
+                    )
+                    wandb_run = None
+                    wandb_mode_effective = None
+                    wandb_log_enabled = False
+            else:
+                raise
 
     best_val = float("inf")
     best_epoch = -1
@@ -590,10 +661,6 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             if batch_ids is not None:
                 epoch_metrics["batch_latent_norm_r2"] = _batch_r2(z_norm, batch_ids[subset])
 
-        _write_jsonl(metrics_path, epoch_metrics)
-        if wandb_run is not None:
-            wandb_run.log(epoch_metrics, step=epoch)
-
         val_key = epoch_metrics["val_recon"]
         if math.isfinite(val_key) and val_key < best_val:
             best_val = val_key
@@ -603,7 +670,22 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         else:
             bad_epochs += 1
 
-        if bad_epochs >= cfg.patience:
+        should_stop = bad_epochs >= cfg.patience
+        _write_jsonl(metrics_path, epoch_metrics)
+        if wandb_run is not None and wandb_log_enabled:
+            log_every = max(1, int(cfg.wandb_log_every))
+            should_log = (epoch % log_every) == 0 or should_stop or epoch == cfg.epochs
+            if should_log:
+                try:
+                    wandb_run.log(epoch_metrics, step=epoch)
+                except Exception as exc:
+                    print(
+                        f"[hmae] W&B log failed ({exc}). "
+                        "Disabling further W&B logging for this run."
+                    )
+                    wandb_log_enabled = False
+
+        if should_stop:
             break
 
     if best_state is None:
@@ -657,15 +739,18 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "run_name": getattr(wandb_run, "name", None) if wandb_run is not None else None,
             "run_id": getattr(wandb_run, "id", None) if wandb_run is not None else None,
             "run_url": getattr(wandb_run, "url", None) if wandb_run is not None else None,
-            "mode": cfg.wandb_mode if cfg.wandb_enable else None,
+            "mode": wandb_mode_effective if cfg.wandb_enable else None,
         },
     }
     with (out_dir / "run_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
     if wandb_run is not None:
-        wandb_run.summary["best_epoch"] = int(best_epoch)
-        wandb_run.summary["best_val_recon"] = float(best_val)
-        wandb_run.finish()
+        try:
+            wandb_run.summary["best_epoch"] = int(best_epoch)
+            wandb_run.summary["best_val_recon"] = float(best_val)
+            wandb_run.finish()
+        except Exception as exc:
+            print(f"[hmae] W&B finish failed ({exc}).")
 
     return summary

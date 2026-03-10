@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import socket
+import subprocess
+import sys
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -54,6 +57,8 @@ class TrainConfig:
     ff_mult: int = 4
     dropout: float = 0.1
     latent_dim: int = 64
+    latent_tokens: int = 8
+    latent_feedback_mode: str = "cross_attn"
     use_obs_embedding: bool = True
     use_snp_id_embedding: bool = False
     embedding_batch_size: int = 128
@@ -61,6 +66,10 @@ class TrainConfig:
     coverage_monitor_subset: int = 512
     monitor_every: int = 1
     batch_labels_tsv: Optional[str] = None
+    probe_eval_enable: bool = False
+    probe_metadata_tsv: Optional[str] = None
+    probe_target_col: str = "Political Entity"
+    probe_seed: int = 42
     wandb_enable: bool = False
     wandb_project: str = "token-snp-mask"
     wandb_entity: Optional[str] = None
@@ -268,6 +277,13 @@ def _load_batch_labels(path: Path, sample_ids: Sequence[str]) -> np.ndarray:
     return labels
 
 
+@dataclass(frozen=True)
+class EncodedEmbeddings:
+    mean: np.ndarray
+    tokens: np.ndarray
+    concat: np.ndarray
+
+
 @torch.no_grad()
 def _encode_sample_embeddings(
     model: TokenSNPMaskedModel,
@@ -278,11 +294,19 @@ def _encode_sample_embeddings(
     n_snps: int,
     device: torch.device,
     seed: int,
-) -> np.ndarray:
+) -> EncodedEmbeddings:
     model.eval()
     rng = np.random.default_rng(seed)
 
-    latents = np.zeros((len(indices), model.cfg.latent_dim), dtype=np.float32)
+    latents_mean = np.zeros((len(indices), model.cfg.latent_dim), dtype=np.float32)
+    latents_tokens = np.zeros(
+        (len(indices), model.cfg.latent_tokens, model.cfg.latent_dim),
+        dtype=np.float32,
+    )
+    latents_concat = np.zeros(
+        (len(indices), model.cfg.latent_tokens * model.cfg.latent_dim),
+        dtype=np.float32,
+    )
     max_start = max(1, n_snps - cfg.window_size + 1)
 
     write_ptr = 0
@@ -290,7 +314,10 @@ def _encode_sample_embeddings(
         end = min(start + cfg.embedding_batch_size, len(indices))
         batch_idx = indices[start:end]
 
-        accum = np.zeros((len(batch_idx), model.cfg.latent_dim), dtype=np.float32)
+        accum_tokens = np.zeros(
+            (len(batch_idx), model.cfg.latent_tokens, model.cfg.latent_dim),
+            dtype=np.float32,
+        )
         counts = np.zeros(len(batch_idx), dtype=np.float32)
 
         for _ in range(cfg.embedding_windows_per_sample):
@@ -319,15 +346,54 @@ def _encode_sample_embeddings(
                 obs_mask=batch["obs_mask"],
                 snp_idx=batch["snp_idx"] if cfg.use_snp_id_embedding else None,
             )
-            emb = out["window_embedding"].detach().cpu().numpy()
-            accum += emb
+            emb_tokens = out["window_latent_tokens"].detach().cpu().numpy()
+            accum_tokens += emb_tokens
             counts += 1.0
 
-        lat = accum / counts[:, None].clip(min=1.0)
-        latents[write_ptr : write_ptr + len(batch_idx)] = lat
+        tokens = accum_tokens / counts[:, None, None].clip(min=1.0)
+        mean = tokens.mean(axis=1)
+        concat = tokens.reshape(tokens.shape[0], -1)
+        latents_mean[write_ptr : write_ptr + len(batch_idx)] = mean
+        latents_tokens[write_ptr : write_ptr + len(batch_idx)] = tokens
+        latents_concat[write_ptr : write_ptr + len(batch_idx)] = concat
         write_ptr += len(batch_idx)
 
-    return latents
+    return EncodedEmbeddings(
+        mean=latents_mean,
+        tokens=latents_tokens,
+        concat=latents_concat,
+    )
+
+
+def _run_probe_eval(cfg: TrainConfig, out_dir: Path) -> Dict[str, object]:
+    if not cfg.probe_eval_enable:
+        return {}
+    if not cfg.probe_metadata_tsv:
+        raise ValueError("probe_eval_enable=True requires probe_metadata_tsv to be set")
+
+    script_path = Path(__file__).resolve().parents[1] / "evaluate_latent_probe.py"
+    if not script_path.exists():
+        raise FileNotFoundError(f"Probe evaluation script not found: {script_path}")
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--run_dir",
+        str(out_dir),
+        "--metadata_tsv",
+        str(cfg.probe_metadata_tsv),
+        "--target_col",
+        str(cfg.probe_target_col),
+        "--seed",
+        str(cfg.probe_seed),
+    ]
+    subprocess.run(cmd, check=True)
+
+    probe_summary_path = out_dir / "probe_summary.json"
+    if not probe_summary_path.exists():
+        raise FileNotFoundError(f"Probe summary not produced: {probe_summary_path}")
+    with probe_summary_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def run_training(cfg: TrainConfig) -> Dict[str, object]:
@@ -380,6 +446,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         ff_mult=cfg.ff_mult,
         dropout=cfg.dropout,
         latent_dim=cfg.latent_dim,
+        latent_tokens=cfg.latent_tokens,
+        latent_feedback_mode=cfg.latent_feedback_mode,
         use_obs_embedding=cfg.use_obs_embedding,
         use_snp_id_embedding=cfg.use_snp_id_embedding,
     )
@@ -391,21 +459,37 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     )
 
     wandb_run = None
+    wandb_mode_active = None
     if cfg.wandb_enable:
         if wandb is None:
             raise RuntimeError(
                 "W&B requested but wandb package is not installed. "
                 "Install with: pip install wandb"
             )
-        wandb_run = wandb.init(
-            project=cfg.wandb_project,
-            entity=cfg.wandb_entity,
-            name=cfg.wandb_name or Path(cfg.output_dir).name,
-            group=cfg.wandb_group,
-            tags=_parse_wandb_tags(cfg.wandb_tags),
-            mode=cfg.wandb_mode,
-            dir=str(out_dir),
-            config={
+        requested_mode = cfg.wandb_mode
+        init_mode = requested_mode
+        if requested_mode == "online":
+            try:
+                with socket.create_connection(("api.wandb.ai", 443), timeout=5):
+                    pass
+            except OSError as exc:
+                print(
+                    "[WARN] W&B connectivity check failed on this node; "
+                    f"switching to offline mode. reason={exc!r}"
+                )
+                init_mode = "offline"
+        wandb_mode_active = init_mode
+
+        init_kwargs = {
+            "project": cfg.wandb_project,
+            "entity": cfg.wandb_entity,
+            "name": cfg.wandb_name or Path(cfg.output_dir).name,
+            "group": cfg.wandb_group,
+            "tags": _parse_wandb_tags(cfg.wandb_tags),
+            "mode": init_mode,
+            "dir": str(out_dir),
+            "settings": wandb.Settings(init_timeout=180),
+            "config": {
                 "train_cfg": asdict(cfg),
                 "model_cfg": asdict(model_cfg),
                 "n_samples": meta.n_samples,
@@ -413,7 +497,20 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 "n_classes": meta.n_classes,
                 "device": str(device),
             },
-        )
+        }
+        try:
+            wandb_run = wandb.init(**init_kwargs)
+        except Exception as exc:
+            if init_mode == "online":
+                print(
+                    "[WARN] W&B online init failed; falling back to offline mode. "
+                    f"reason={exc!r}"
+                )
+                init_kwargs["mode"] = "offline"
+                wandb_mode_active = "offline"
+                wandb_run = wandb.init(**init_kwargs)
+            else:
+                raise
 
     coverage_fraction = compute_observed_fraction(geno_mm)
     sample_ids = load_sample_ids(meta.sample_ids_path, meta.n_samples)
@@ -693,7 +790,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 # Keep embedding windows fixed across epochs for comparable confound monitoring.
                 seed=cfg.seed + 8_888,
             )
-            lat_norm = np.linalg.norm(lat, axis=1)
+            lat_norm = np.linalg.norm(lat.mean, axis=1)
             cov_corr = _pearson_corr(lat_norm, coverage_fraction[monitor_ids])
             if batch_labels is not None:
                 batch_r2 = _batch_r2(lat_norm, batch_labels[monitor_ids])
@@ -752,14 +849,30 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         seed=cfg.seed + 10_000,
     )
 
-    np.save(out_dir / "global_latents.npy", global_latents)
+    np.save(out_dir / "global_latents.npy", global_latents.mean)
+    np.save(out_dir / "global_latent_tokens.npy", global_latents.tokens)
+    np.save(out_dir / "global_latents_concat.npy", global_latents.concat)
 
     with (out_dir / "global_latents.csv").open("w", encoding="utf-8") as handle:
-        header = ["sample_id"] + [f"z{i}" for i in range(global_latents.shape[1])]
+        header = ["sample_id"] + [f"z{i}" for i in range(global_latents.mean.shape[1])]
         handle.write(",".join(header) + "\n")
-        for sid, vec in zip(sample_ids, global_latents):
+        for sid, vec in zip(sample_ids, global_latents.mean):
             row = [sid] + [f"{float(v):.7g}" for v in vec]
             handle.write(",".join(row) + "\n")
+
+    coverage_corr_mean = _pearson_corr(np.linalg.norm(global_latents.mean, axis=1), coverage_fraction)
+    coverage_corr_concat = _pearson_corr(
+        np.linalg.norm(global_latents.concat, axis=1),
+        coverage_fraction,
+    )
+    coverage_corr_tokens: Dict[str, float] = {}
+    for tok_i in range(global_latents.tokens.shape[1]):
+        tok_norm = np.linalg.norm(global_latents.tokens[:, tok_i, :], axis=1)
+        coverage_corr_tokens[f"token_{tok_i}"] = _pearson_corr(tok_norm, coverage_fraction)
+
+    probe_summary: Dict[str, object] = {}
+    if cfg.probe_eval_enable:
+        probe_summary = _run_probe_eval(cfg=cfg, out_dir=out_dir)
 
     summary = {
         "best_epoch": int(best_epoch),
@@ -773,22 +886,42 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         "output_dir": str(out_dir),
         "model_config": asdict(model_cfg),
         "train_config": asdict(cfg),
+        "final_representation_metrics": {
+            "coverage_corr_mean": float(coverage_corr_mean),
+            "coverage_corr_concat": float(coverage_corr_concat),
+            "coverage_corr_tokens": coverage_corr_tokens,
+        },
+        "probe": probe_summary,
         "wandb": {
             "enabled": bool(cfg.wandb_enable),
             "run_name": getattr(wandb_run, "name", None) if wandb_run is not None else None,
             "run_id": getattr(wandb_run, "id", None) if wandb_run is not None else None,
             "run_url": getattr(wandb_run, "url", None) if wandb_run is not None else None,
-            "mode": cfg.wandb_mode if cfg.wandb_enable else None,
+            "mode": wandb_mode_active,
         },
     }
     with (out_dir / "run_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
     if wandb_run is not None:
+        probe_metrics = probe_summary.get("metrics", {}) if isinstance(probe_summary, dict) else {}
+        probe_log = {}
+        if isinstance(probe_metrics, dict):
+            for key, values in probe_metrics.items():
+                if not isinstance(values, dict):
+                    continue
+                if "macro_f1" in values:
+                    probe_log[f"probe_macro_f1_{key}"] = float(values["macro_f1"])
+                if "accuracy" in values:
+                    probe_log[f"probe_accuracy_{key}"] = float(values["accuracy"])
         wandb_run.summary.update(
             {
                 "best_epoch": best_epoch,
                 "best_val_ce": best_val,
+                "coverage_corr_mean": float(coverage_corr_mean),
+                "coverage_corr_concat": float(coverage_corr_concat),
+                **{f"coverage_corr_token_{k.split('_')[-1]}": float(v) for k, v in coverage_corr_tokens.items()},
+                **probe_log,
             }
         )
         wandb_run.finish()

@@ -44,6 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ff_mult", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--latent_dim", type=int, default=64)
+    p.add_argument("--latent_tokens", type=int, default=8)
+    p.add_argument(
+        "--latent_feedback_mode",
+        choices=("cross_attn",),
+        default="cross_attn",
+        help="How latent tokens are fed into reconstruction.",
+    )
     p.add_argument("--disable_obs_embedding", action="store_true")
     p.add_argument("--use_snp_id_embedding", action="store_true")
 
@@ -55,6 +62,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch_labels_tsv",
         default=None,
         help="Optional two-column TSV/space file: sample_id batch_label",
+    )
+    p.add_argument(
+        "--probe_eval_enable",
+        action="store_true",
+        help="Run ancestry probe evaluation after training.",
+    )
+    p.add_argument(
+        "--probe_metadata_tsv",
+        default=None,
+        help="Metadata TSV/ANNO used for probe evaluation.",
+    )
+    p.add_argument(
+        "--probe_target_col",
+        default="Political Entity",
+        help="Metadata column used as ancestry probe target.",
+    )
+    p.add_argument(
+        "--probe_seed",
+        type=int,
+        default=42,
+        help="Random seed used by probe train/val/test split.",
     )
 
     p.add_argument("--wandb", action="store_true", help="Enable W&B logging.")
@@ -109,6 +137,8 @@ def main() -> None:
         ff_mult=args.ff_mult,
         dropout=args.dropout,
         latent_dim=args.latent_dim,
+        latent_tokens=args.latent_tokens,
+        latent_feedback_mode=args.latent_feedback_mode,
         use_obs_embedding=not bool(args.disable_obs_embedding),
         use_snp_id_embedding=bool(args.use_snp_id_embedding),
         embedding_batch_size=args.embedding_batch_size,
@@ -116,6 +146,10 @@ def main() -> None:
         coverage_monitor_subset=args.coverage_monitor_subset,
         monitor_every=args.monitor_every,
         batch_labels_tsv=args.batch_labels_tsv,
+        probe_eval_enable=bool(args.probe_eval_enable),
+        probe_metadata_tsv=args.probe_metadata_tsv,
+        probe_target_col=args.probe_target_col,
+        probe_seed=args.probe_seed,
         wandb_enable=bool(args.wandb),
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,

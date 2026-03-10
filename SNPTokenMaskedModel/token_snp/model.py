@@ -20,6 +20,8 @@ class TokenSNPConfig:
     ff_mult: int = 4
     dropout: float = 0.1
     latent_dim: int = 64
+    latent_tokens: int = 8
+    latent_feedback_mode: str = "cross_attn"
     use_obs_embedding: bool = True
     use_snp_id_embedding: bool = False
 
@@ -28,6 +30,11 @@ class TokenSNPMaskedModel(nn.Module):
     def __init__(self, cfg: TokenSNPConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        if cfg.latent_feedback_mode != "cross_attn":
+            raise ValueError(
+                f"Unsupported latent_feedback_mode={cfg.latent_feedback_mode!r}. "
+                "Only 'cross_attn' is currently implemented."
+            )
 
         self.missing_token = cfg.n_classes
         self.mask_token = cfg.n_classes + 1
@@ -63,6 +70,21 @@ class TokenSNPMaskedModel(nn.Module):
         self.chunk_encoder = nn.TransformerEncoder(chunk_layer, num_layers=cfg.chunk_layers)
 
         self.norm = nn.LayerNorm(cfg.d_model)
+        self.latent_queries = nn.Parameter(torch.randn(cfg.latent_tokens, cfg.d_model) * 0.02)
+        self.token_to_latent_attn = nn.MultiheadAttention(
+            embed_dim=cfg.d_model,
+            num_heads=cfg.n_heads,
+            dropout=cfg.dropout,
+            batch_first=True,
+        )
+        self.latent_from_tokens_norm = nn.LayerNorm(cfg.d_model)
+        self.token_from_latent_attn = nn.MultiheadAttention(
+            embed_dim=cfg.d_model,
+            num_heads=cfg.n_heads,
+            dropout=cfg.dropout,
+            batch_first=True,
+        )
+        self.token_feedback_norm = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.n_classes)
         self.latent_proj = nn.Linear(cfg.d_model, cfg.latent_dim)
 
@@ -136,14 +158,33 @@ class TokenSNPMaskedModel(nn.Module):
         fused = fused[:, :seq_len, :]
 
         h = self.norm(fused)
-        logits = self.head(h)
+        token_padding_mask = self._sanitize_padding_mask(obs_mask[:, :seq_len] <= 0.5)
 
-        pooled_weights = obs_mask[:, :seq_len].unsqueeze(-1)
-        pooled = (h * pooled_weights).sum(dim=1) / pooled_weights.sum(dim=1).clamp_min(1.0)
-        window_embedding = self.latent_proj(pooled)
+        latent_q = self.latent_queries.unsqueeze(0).expand(bsz, -1, -1)
+        latent_from_tokens, _ = self.token_to_latent_attn(
+            query=latent_q,
+            key=h,
+            value=h,
+            key_padding_mask=token_padding_mask,
+            need_weights=False,
+        )
+        latent_states = self.latent_from_tokens_norm(latent_q + latent_from_tokens)
+
+        token_from_latents, _ = self.token_from_latent_attn(
+            query=h,
+            key=latent_states,
+            value=latent_states,
+            need_weights=False,
+        )
+        h = self.token_feedback_norm(h + token_from_latents)
+
+        logits = self.head(h)
+        window_latent_tokens = self.latent_proj(latent_states)
+        window_embedding = window_latent_tokens.mean(dim=1)
 
         return {
             "logits": logits,
             "hidden": h,
             "window_embedding": window_embedding,
+            "window_latent_tokens": window_latent_tokens,
         }

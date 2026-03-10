@@ -5,6 +5,8 @@ reduction with:
 
 - windowed SNP processing
 - configurable local encoder across windows (`conv_attn` or legacy `meanpool`)
+- configurable local encoder across windows (`conv_attn`,
+  `conv_attn_multislot`, or legacy `meanpool`)
 - masked denoising objective on observed SNPs
 - attention-based global aggregation over window latents
 - optional variational global latent
@@ -59,10 +61,12 @@ python3 train_hmae.py \
   --window_latent_dim 32 \
   --global_latent_dim 32 \
   --local_encoder_type conv_attn \
+  --window_latent_slots 4 \
   --local_conv_layers 4 \
   --local_conv_kernel 7 \
   --local_attn_heads 4 \
   --local_dropout 0.1 \
+  --decoder_attn_heads 4 \
   --mask_prob 0.2 \
   --observed_dropout 0.1
 ```
@@ -85,6 +89,17 @@ python3 train_hmae.py \
 - `--require_cuda`: fail early if CUDA is unavailable.
 - `--amp` / `--no-amp`: mixed precision override.
   - Default behavior is automatic: AMP on CUDA, off on CPU.
+- `--window_latent_slots`: number of learned latent query tokens per window
+  in `conv_attn_multislot` mode.
+- `--decoder_attn_heads`: decoder cross-attention heads (multislot path).
+
+### 2d) W&B online with low overhead
+
+- `--wandb_mode online` to stream to W&B directly.
+- `--wandb_log_every 2` to reduce payload/chattiness.
+- `--wandb_init_timeout 45` to cap online init wait before fallback.
+- `--wandb_online_fallback` (default) allows automatic fallback if online init
+  or logging fails, so training continues and local files are still written.
 
 ### 3) Outputs
 
@@ -133,6 +148,8 @@ This writes:
 - This baseline uses cross-entropy reconstruction on intentionally masked
   observed SNPs only.
 - It uses random window sampling per step (not all windows at once).
-- `conv_attn` local encoder is the default for v2; use
-  `--local_encoder_type meanpool` for backward-compatible behavior.
+- `conv_attn` local encoder is the default for v2.
+- `conv_attn_multislot` uses learned latent slot queries per window and passes
+  all slot tokens to the global transformer.
+- Use `--local_encoder_type meanpool` for backward-compatible behavior.
 - Use `--variational` to enable a global VAE latent with KL term.

@@ -51,17 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--local_hidden_dim", type=int, default=128)
     p.add_argument(
         "--local_encoder_type",
-        choices=("conv_attn", "meanpool"),
+        choices=("conv_attn", "conv_attn_multislot", "meanpool"),
         default="conv_attn",
     )
     p.add_argument("--local_conv_layers", type=int, default=4)
     p.add_argument("--local_conv_kernel", type=int, default=7)
     p.add_argument("--local_attn_heads", type=int, default=4)
     p.add_argument("--local_dropout", type=float, default=0.1)
+    p.add_argument("--window_latent_slots", type=int, default=4)
     p.add_argument("--global_model_dim", type=int, default=128)
     p.add_argument("--global_heads", type=int, default=4)
     p.add_argument("--global_layers", type=int, default=2)
     p.add_argument("--decoder_hidden_dim", type=int, default=128)
+    p.add_argument("--decoder_attn_heads", type=int, default=4)
 
     p.add_argument("--include_window_coverage", action="store_true")
     p.add_argument("--require_cuda", action="store_true")
@@ -88,6 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb_group", default=None)
     p.add_argument("--wandb_tags", default=None, help="Comma-separated tags.")
     p.add_argument("--wandb_mode", choices=("offline", "online"), default="offline")
+    p.add_argument("--wandb_log_every", type=int, default=2)
+    p.add_argument("--wandb_init_timeout", type=int, default=60)
+    p.add_argument("--wandb_online_fallback", dest="wandb_online_fallback", action="store_true")
+    p.add_argument("--no-wandb_online_fallback", dest="wandb_online_fallback", action="store_false")
+    p.set_defaults(wandb_online_fallback=True)
     return p
 
 
@@ -124,10 +131,12 @@ def main() -> None:
         local_conv_kernel=args.local_conv_kernel,
         local_attn_heads=args.local_attn_heads,
         local_dropout=args.local_dropout,
+        window_latent_slots=args.window_latent_slots,
         global_model_dim=args.global_model_dim,
         global_heads=args.global_heads,
         global_layers=args.global_layers,
         decoder_hidden_dim=args.decoder_hidden_dim,
+        decoder_attn_heads=args.decoder_attn_heads,
         include_window_coverage=bool(args.include_window_coverage),
         require_cuda=bool(args.require_cuda),
         amp=args.amp,
@@ -143,6 +152,9 @@ def main() -> None:
         wandb_group=args.wandb_group,
         wandb_tags=args.wandb_tags,
         wandb_mode=args.wandb_mode,
+        wandb_log_every=args.wandb_log_every,
+        wandb_init_timeout=args.wandb_init_timeout,
+        wandb_online_fallback=bool(args.wandb_online_fallback),
     )
     summary = run_training(cfg)
     print(json.dumps(summary, indent=2))
