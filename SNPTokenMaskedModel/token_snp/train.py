@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 try:
     import wandb
@@ -65,6 +66,11 @@ class TrainConfig:
     embedding_windows_per_sample: int = 32
     coverage_monitor_subset: int = 512
     monitor_every: int = 1
+    adv_coverage_enable: bool = False
+    lambda_adv_target: float = 0.0
+    lambda_adv_warmup_epochs: int = 10
+    adv_mlp_hidden_dim: int = 128
+    adv_mlp_dropout: float = 0.1
     batch_labels_tsv: Optional[str] = None
     probe_eval_enable: bool = False
     probe_metadata_tsv: Optional[str] = None
@@ -115,6 +121,72 @@ def _masked_accuracy(logits: torch.Tensor, targets: torch.Tensor, valid_mask: to
     preds = logits.argmax(dim=-1)
     correct = (preds[valid_mask] == targets[valid_mask]).float().mean()
     return float(correct.detach().cpu().item())
+
+
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambda_adv: float) -> torch.Tensor:
+        ctx.lambda_adv = float(lambda_adv)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        return -ctx.lambda_adv * grad_output, None
+
+
+def grad_reverse(x: torch.Tensor, lambda_adv: float) -> torch.Tensor:
+    return GradientReversalFunction.apply(x, float(lambda_adv))
+
+
+class CoverageAdversary(nn.Module):
+    def __init__(self, latent_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).squeeze(-1)
+
+
+def _current_lambda_adv(
+    epoch: int,
+    step_idx: int,
+    steps_per_epoch: int,
+    target: float,
+    warmup_epochs: int,
+) -> float:
+    if target <= 0.0:
+        return 0.0
+    if warmup_epochs <= 0:
+        return float(target)
+
+    total_warmup_steps = max(1, warmup_epochs * max(1, steps_per_epoch))
+    current_step = (max(0, epoch - 1) * max(1, steps_per_epoch)) + max(0, step_idx)
+    if current_step >= total_warmup_steps:
+        return float(target)
+    denom = max(1, total_warmup_steps - 1)
+    progress = min(1.0, float(current_step) / float(denom))
+    return float(target * progress)
+
+
+def _in_sample_r2_with_intercept(x: np.ndarray, y: np.ndarray) -> float:
+    if x.shape[0] == 0 or y.shape[0] == 0:
+        return float("nan")
+    x_aug = np.concatenate([np.ones((x.shape[0], 1), dtype=np.float64), x.astype(np.float64)], axis=1)
+    beta, _, _, _ = np.linalg.lstsq(x_aug, y.astype(np.float64), rcond=None)
+    y_pred = x_aug @ beta
+    ss_res = float(np.sum((y - y_pred) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    if ss_tot <= 0:
+        return float("nan")
+    return float(1.0 - (ss_res / ss_tot))
 
 
 def _debug_print_token_config(meta_n_classes: int, model: TokenSNPMaskedModel) -> None:
@@ -452,11 +524,18 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         use_snp_id_embedding=cfg.use_snp_id_embedding,
     )
     model = TokenSNPMaskedModel(model_cfg).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-    )
+    adv_enabled = bool(cfg.adv_coverage_enable and cfg.lambda_adv_target > 0.0)
+    coverage_adversary: Optional[CoverageAdversary] = None
+    trainable_params: List[torch.nn.Parameter] = list(model.parameters())
+    if adv_enabled:
+        coverage_adversary = CoverageAdversary(
+            latent_dim=cfg.latent_dim,
+            hidden_dim=cfg.adv_mlp_hidden_dim,
+            dropout=cfg.adv_mlp_dropout,
+        ).to(device)
+        trainable_params.extend(list(coverage_adversary.parameters()))
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 
     wandb_run = None
     wandb_mode_active = None
@@ -513,6 +592,20 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 raise
 
     coverage_fraction = compute_observed_fraction(geno_mm)
+    train_cov = coverage_fraction[splits["train"]]
+    cov_mu = float(np.mean(train_cov))
+    cov_sigma = float(np.std(train_cov))
+    cov_sigma = max(cov_sigma, 1e-6)
+    coverage_z = (coverage_fraction - cov_mu) / cov_sigma
+    coverage_z_t = torch.from_numpy(coverage_z.astype(np.float32, copy=False)).to(device=device)
+    if adv_enabled:
+        print(
+            "[INFO] adversarial_coverage "
+            f"enabled=1 lambda_adv_target={cfg.lambda_adv_target} warmup_epochs={cfg.lambda_adv_warmup_epochs} "
+            f"cov_mu={cov_mu:.6f} cov_sigma={cov_sigma:.6f}"
+        )
+    else:
+        print("[INFO] adversarial_coverage enabled=0")
     sample_ids = load_sample_ids(meta.sample_ids_path, meta.n_samples)
 
     # Step 5: split leakage diagnostics.
@@ -580,14 +673,19 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
+        if coverage_adversary is not None:
+            coverage_adversary.train()
         train_loss_sum = 0.0
         train_masked = 0
         train_acc_sum = 0.0
         train_acc_count = 0
+        train_adv_sum = 0.0
+        train_adv_count = 0
         train_eligible_total = 0
         train_masked_total = 0
         train_hist: Counter = Counter()
         printed_train_examples = False
+        epoch_lambda_adv = 0.0
 
         for step_idx in range(cfg.steps_per_epoch):
             batch_idx = _sample_rows(rng, splits["train"], cfg.batch_size)
@@ -615,7 +713,26 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             n_total_tokens = int(batch["tokens"].numel())
             n_eligible_maskable = int((batch["eligible_mask"] > 0.5).sum().detach().cpu().item())
             n_masked_positions = int((batch["train_mask"] > 0.5).sum().detach().cpu().item())
-            loss, n_used_for_loss = _masked_recon_ce(out["logits"], batch["targets"], valid_mask)
+            recon_loss, n_used_for_loss = _masked_recon_ce(out["logits"], batch["targets"], valid_mask)
+            lambda_adv_now = _current_lambda_adv(
+                epoch=epoch,
+                step_idx=step_idx,
+                steps_per_epoch=cfg.steps_per_epoch,
+                target=cfg.lambda_adv_target if adv_enabled else 0.0,
+                warmup_epochs=cfg.lambda_adv_warmup_epochs,
+            )
+            epoch_lambda_adv = lambda_adv_now
+
+            if coverage_adversary is not None:
+                z = out["window_embedding"]
+                z_rev = grad_reverse(z, lambda_adv_now)
+                cov_pred = coverage_adversary(z_rev)
+                cov_true = coverage_z_t[batch["sample_idx"]]
+                adv_loss = F.mse_loss(cov_pred, cov_true, reduction="mean")
+            else:
+                adv_loss = recon_loss * 0.0
+
+            total_loss = recon_loss + adv_loss
 
             if cfg.debug_mode and (
                 cfg.debug_max_batches_per_phase < 0 or step_idx < cfg.debug_max_batches_per_phase
@@ -634,13 +751,15 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            total_loss.backward()
             if cfg.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(trainable_params, cfg.grad_clip_norm)
             optimizer.step()
 
-            train_loss_sum += float(loss.detach().cpu().item()) * n_used_for_loss
+            train_loss_sum += float(recon_loss.detach().cpu().item()) * n_used_for_loss
             train_masked += n_used_for_loss
+            train_adv_sum += float(adv_loss.detach().cpu().item())
+            train_adv_count += 1
             train_eligible_total += n_eligible_maskable
             train_masked_total += n_masked_positions
             train_hist.update(_counter_from_tensor(batch["targets"][batch["train_mask"] > 0.5]))
@@ -667,13 +786,18 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
         train_ce = train_loss_sum / float(max(1, train_masked))
         train_acc = train_acc_sum / float(max(1, train_acc_count))
+        train_adv_mse = train_adv_sum / float(max(1, train_adv_count))
         train_masked_rate = float(train_masked_total) / float(max(1, train_eligible_total))
 
         model.eval()
+        if coverage_adversary is not None:
+            coverage_adversary.eval()
         val_loss_sum = 0.0
         val_masked = 0
         val_acc_sum = 0.0
         val_acc_count = 0
+        val_adv_sum = 0.0
+        val_adv_count = 0
         val_eligible_total = 0
         val_masked_total = 0
         val_hist: Counter = Counter()
@@ -705,7 +829,13 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 n_total_tokens = int(batch["tokens"].numel())
                 n_eligible_maskable = int((batch["eligible_mask"] > 0.5).sum().detach().cpu().item())
                 n_masked_positions = int((batch["train_mask"] > 0.5).sum().detach().cpu().item())
-                loss, n_used_for_loss = _masked_recon_ce(out["logits"], batch["targets"], valid_mask)
+                recon_loss, n_used_for_loss = _masked_recon_ce(out["logits"], batch["targets"], valid_mask)
+                if coverage_adversary is not None:
+                    cov_pred = coverage_adversary(out["window_embedding"])
+                    cov_true = coverage_z_t[batch["sample_idx"]]
+                    adv_loss = F.mse_loss(cov_pred, cov_true, reduction="mean")
+                else:
+                    adv_loss = recon_loss * 0.0
 
                 if cfg.debug_mode and (
                     cfg.debug_max_batches_per_phase < 0 or step_idx < cfg.debug_max_batches_per_phase
@@ -722,8 +852,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                     f"used={n_used_for_loss}, masked={n_masked_positions}"
                 )
 
-                val_loss_sum += float(loss.detach().cpu().item()) * n_used_for_loss
+                val_loss_sum += float(recon_loss.detach().cpu().item()) * n_used_for_loss
                 val_masked += n_used_for_loss
+                val_adv_sum += float(adv_loss.detach().cpu().item())
+                val_adv_count += 1
                 val_eligible_total += n_eligible_maskable
                 val_masked_total += n_masked_positions
                 val_hist.update(_counter_from_tensor(batch["targets"][batch["train_mask"] > 0.5]))
@@ -750,6 +882,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
         val_ce = val_loss_sum / float(max(1, val_masked))
         val_acc = val_acc_sum / float(max(1, val_acc_count))
+        val_adv_mse = val_adv_sum / float(max(1, val_adv_count))
         val_masked_rate = float(val_masked_total) / float(max(1, val_eligible_total))
 
         if cfg.debug_mode:
@@ -801,6 +934,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "val_ce": float(val_ce),
             "train_masked_acc": float(train_acc),
             "val_masked_acc": float(val_acc),
+            "train_adv_mse": float(train_adv_mse),
+            "val_adv_mse": float(val_adv_mse),
+            "lambda_adv": float(epoch_lambda_adv if adv_enabled else 0.0),
             "train_masked_tokens": float(train_masked),
             "val_masked_tokens": float(val_masked),
             "train_masked_rate": float(train_masked_rate),
@@ -822,6 +958,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 {
                     "epoch": epoch,
                     "model_state": model.state_dict(),
+                    "coverage_adversary_state": (
+                        coverage_adversary.state_dict() if coverage_adversary is not None else None
+                    ),
                     "model_config": asdict(model_cfg),
                     "train_config": asdict(cfg),
                     "best_val_ce": best_val,
@@ -836,6 +975,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
     ckpt = torch.load(out_dir / "best_model.pt", map_location=device)
     model.load_state_dict(ckpt["model_state"])
+    if coverage_adversary is not None and ckpt.get("coverage_adversary_state") is not None:
+        coverage_adversary.load_state_dict(ckpt["coverage_adversary_state"])
 
     all_ids = np.arange(meta.n_samples, dtype=np.int64)
     global_latents = _encode_sample_embeddings(
@@ -870,6 +1011,15 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         tok_norm = np.linalg.norm(global_latents.tokens[:, tok_i, :], axis=1)
         coverage_corr_tokens[f"token_{tok_i}"] = _pearson_corr(tok_norm, coverage_fraction)
 
+    z_mean = global_latents.mean.astype(np.float64, copy=False)
+    z_norm = np.linalg.norm(z_mean, axis=1, keepdims=True)
+    z_unit = z_mean / np.maximum(z_norm, 1e-12)
+    r2_coverage_from_z = _in_sample_r2_with_intercept(x=z_mean, y=coverage_fraction.astype(np.float64))
+    r2_coverage_from_z_unit = _in_sample_r2_with_intercept(
+        x=z_unit,
+        y=coverage_fraction.astype(np.float64),
+    )
+
     probe_summary: Dict[str, object] = {}
     if cfg.probe_eval_enable:
         probe_summary = _run_probe_eval(cfg=cfg, out_dir=out_dir)
@@ -890,6 +1040,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "coverage_corr_mean": float(coverage_corr_mean),
             "coverage_corr_concat": float(coverage_corr_concat),
             "coverage_corr_tokens": coverage_corr_tokens,
+            "r2_coverage_from_z": float(r2_coverage_from_z),
+            "r2_coverage_from_z_unit": float(r2_coverage_from_z_unit),
         },
         "probe": probe_summary,
         "wandb": {
@@ -920,6 +1072,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 "best_val_ce": best_val,
                 "coverage_corr_mean": float(coverage_corr_mean),
                 "coverage_corr_concat": float(coverage_corr_concat),
+                "r2_coverage_from_z": float(r2_coverage_from_z),
+                "r2_coverage_from_z_unit": float(r2_coverage_from_z_unit),
                 **{f"coverage_corr_token_{k.split('_')[-1]}": float(v) for k, v in coverage_corr_tokens.items()},
                 **probe_log,
             }

@@ -64,6 +64,28 @@ python3 train_token_snp.py \
   --wandb_project token-snp-mask
 ```
 
+### 2c) Adversarial coverage removal (GRL)
+
+The training loop supports adversarial removal of coverage signal from pooled latent `z`.
+An MLP adversary predicts standardized `coverage_observed_fraction`; gradients are reversed
+before reaching the encoder so the encoder is pushed to remove coverage information.
+
+```bash
+python3 train_token_snp.py \
+  --meta_json /path/to/europe_tokenized.meta.json \
+  --output_dir /path/to/projects/token_snp_europe_advcov \
+  --adv_coverage_enable \
+  --lambda_adv_target 0.05 \
+  --lambda_adv_warmup_epochs 10 \
+  --adv_mlp_hidden_dim 128 \
+  --adv_mlp_dropout 0.1
+```
+
+Notes:
+- Reconstruction loss and token masking behavior remain unchanged.
+- Total training objective is `recon_loss + adv_loss` with GRL scaling controlled by `lambda_adv`.
+- Early stopping / best checkpoint selection remains based on `val_ce`.
+
 ## Key outputs
 
 - `metrics.jsonl`: epoch metrics (train/val CE, masked accuracy, leakage monitors)
@@ -76,6 +98,8 @@ Coverage/batch confound monitors:
 
 - `coverage_latent_norm_corr`
 - `batch_latent_norm_r2` (if `--batch_labels_tsv` is provided)
+- `train_adv_mse`, `val_adv_mse`, `lambda_adv` (when adversarial coverage is enabled)
+- final `R²(coverage <- z)` and `R²(coverage <- z / ||z||)` in `run_summary.json`
 
 ## Notes
 

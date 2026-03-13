@@ -59,6 +59,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--coverage_monitor_subset", type=int, default=512)
     p.add_argument("--monitor_every", type=int, default=1)
     p.add_argument(
+        "--adv_coverage_enable",
+        action="store_true",
+        help="Enable gradient-reversal adversary predicting standardized coverage from z.",
+    )
+    p.add_argument(
+        "--lambda_adv_target",
+        type=float,
+        default=0.0,
+        help="Target GRL lambda value after warmup.",
+    )
+    p.add_argument(
+        "--lambda_adv_warmup_epochs",
+        type=int,
+        default=10,
+        help="Linear warmup epochs for lambda_adv from 0 to target.",
+    )
+    p.add_argument(
+        "--adv_mlp_hidden_dim",
+        type=int,
+        default=128,
+        help="Hidden size of coverage adversary MLP.",
+    )
+    p.add_argument(
+        "--adv_mlp_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout in coverage adversary MLP.",
+    )
+    p.add_argument(
         "--batch_labels_tsv",
         default=None,
         help="Optional two-column TSV/space file: sample_id batch_label",
@@ -145,6 +174,11 @@ def main() -> None:
         embedding_windows_per_sample=args.embedding_windows_per_sample,
         coverage_monitor_subset=args.coverage_monitor_subset,
         monitor_every=args.monitor_every,
+        adv_coverage_enable=bool(args.adv_coverage_enable),
+        lambda_adv_target=args.lambda_adv_target,
+        lambda_adv_warmup_epochs=args.lambda_adv_warmup_epochs,
+        adv_mlp_hidden_dim=args.adv_mlp_hidden_dim,
+        adv_mlp_dropout=args.adv_mlp_dropout,
         batch_labels_tsv=args.batch_labels_tsv,
         probe_eval_enable=bool(args.probe_eval_enable),
         probe_metadata_tsv=args.probe_metadata_tsv,
