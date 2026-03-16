@@ -22,6 +22,8 @@ class TokenSNPConfig:
     latent_dim: int = 64
     latent_tokens: int = 8
     latent_feedback_mode: str = "cross_attn"
+    coverage_conditioning_mode: str = "none"
+    coverage_embed_dim: int = 0
     use_obs_embedding: bool = True
     use_snp_id_embedding: bool = False
 
@@ -35,6 +37,13 @@ class TokenSNPMaskedModel(nn.Module):
                 f"Unsupported latent_feedback_mode={cfg.latent_feedback_mode!r}. "
                 "Only 'cross_attn' is currently implemented."
             )
+        if cfg.coverage_conditioning_mode not in {"none", "concat", "film", "film_concat"}:
+            raise ValueError(
+                f"Unsupported coverage_conditioning_mode={cfg.coverage_conditioning_mode!r}. "
+                "Use one of: none, concat, film, film_concat"
+            )
+        if cfg.coverage_embed_dim < 0:
+            raise ValueError("coverage_embed_dim must be >= 0")
 
         self.missing_token = cfg.n_classes
         self.mask_token = cfg.n_classes + 1
@@ -88,6 +97,30 @@ class TokenSNPMaskedModel(nn.Module):
         self.head = nn.Linear(cfg.d_model, cfg.n_classes)
         self.latent_proj = nn.Linear(cfg.d_model, cfg.latent_dim)
 
+        self.coverage_conditioning_mode = cfg.coverage_conditioning_mode
+        self.coverage_embed = None
+        self.coverage_concat_proj = None
+        self.coverage_film = None
+
+        if self.coverage_conditioning_mode in {"concat", "film_concat"}:
+            cov_feat_dim = 1
+            if cfg.coverage_embed_dim > 0:
+                self.coverage_embed = nn.Sequential(
+                    nn.Linear(1, cfg.coverage_embed_dim),
+                    nn.GELU(),
+                    nn.Linear(cfg.coverage_embed_dim, cfg.coverage_embed_dim),
+                    nn.GELU(),
+                )
+                cov_feat_dim = cfg.coverage_embed_dim
+            self.coverage_concat_proj = nn.Linear(cfg.latent_dim + cov_feat_dim, cfg.d_model)
+
+        if self.coverage_conditioning_mode in {"film", "film_concat"}:
+            self.coverage_film = nn.Sequential(
+                nn.Linear(1, 64),
+                nn.GELU(),
+                nn.Linear(64, 2 * cfg.d_model),
+            )
+
     @staticmethod
     def _sanitize_padding_mask(mask: torch.Tensor) -> torch.Tensor:
         # Transformer encoder requires at least one unmasked token per sequence.
@@ -102,6 +135,7 @@ class TokenSNPMaskedModel(nn.Module):
         tokens: torch.Tensor,
         obs_mask: torch.Tensor,
         snp_idx: Optional[torch.Tensor] = None,
+        coverage_std: Optional[torch.Tensor] = None,
     ) -> dict:
         # tokens: [B, L], obs_mask: [B, L], snp_idx: [B, L]
         bsz, seq_len = tokens.shape
@@ -178,13 +212,36 @@ class TokenSNPMaskedModel(nn.Module):
         )
         h = self.token_feedback_norm(h + token_from_latents)
 
-        logits = self.head(h)
         window_latent_tokens = self.latent_proj(latent_states)
         window_embedding = window_latent_tokens.mean(dim=1)
 
+        h_recon = h
+        if self.coverage_conditioning_mode != "none":
+            if coverage_std is None:
+                raise ValueError(
+                    "coverage_std is required when coverage_conditioning_mode != 'none'"
+                )
+            cov_scalar = coverage_std.unsqueeze(-1).to(dtype=h.dtype)
+
+            if self.coverage_conditioning_mode in {"concat", "film_concat"}:
+                cov_feat = cov_scalar
+                if self.coverage_embed is not None:
+                    cov_feat = self.coverage_embed(cov_scalar)
+                z_cov = torch.cat([window_embedding, cov_feat], dim=-1)
+                assert self.coverage_concat_proj is not None
+                h_recon = h_recon + self.coverage_concat_proj(z_cov).unsqueeze(1)
+
+            if self.coverage_conditioning_mode in {"film", "film_concat"}:
+                assert self.coverage_film is not None
+                gamma_beta = self.coverage_film(cov_scalar)
+                gamma, beta = gamma_beta.chunk(2, dim=-1)
+                h_recon = h_recon * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+        logits = self.head(h_recon)
+
         return {
             "logits": logits,
-            "hidden": h,
+            "hidden": h_recon,
             "window_embedding": window_embedding,
             "window_latent_tokens": window_latent_tokens,
         }

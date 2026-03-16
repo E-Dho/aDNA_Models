@@ -83,8 +83,29 @@ python3 train_token_snp.py \
 
 Notes:
 - Reconstruction loss and token masking behavior remain unchanged.
-- Total training objective is `recon_loss + adv_loss` with GRL scaling controlled by `lambda_adv`.
+- Total training objective is `recon_loss + adv_loss + lambda_cov * cov_penalty`.
 - Early stopping / best checkpoint selection remains based on `val_ce`.
+
+### 2d) Branch A knobs (stronger adversary + covariance penalty)
+
+Additional controls:
+
+- `--lambda_cov_target`: target multiplier for covariance/correlation penalty.
+- `--adv_steps_per_batch`: adversary-only update steps per main encoder step.
+- `--lambda_ramp_start_epoch`, `--lambda_ramp_end_epoch`: shared ramp schedule for `lambda_adv` and `lambda_cov`.
+
+Schedule behavior:
+
+- epochs `< lambda_ramp_start_epoch`: both lambdas are `0`.
+- ramp window: linearly increases to target.
+- epochs `>= lambda_ramp_end_epoch`: fixed at target.
+
+### 2e) Branch B knobs (coverage-conditioned reconstruction)
+
+Coverage is provided explicitly to the reconstruction pathway while keeping latent extraction unchanged.
+
+- `--coverage_conditioning_mode none|concat|film|film_concat`
+- `--coverage_embed_dim` (used by concat mode; `0` means scalar coverage directly)
 
 ## Key outputs
 
@@ -93,13 +114,20 @@ Notes:
 - `run_summary.json`: run config + best epoch
 - `global_latents.npy`: `[n_samples, latent_dim]`
 - `global_latents.csv`: sample IDs with latent columns
+- `coverage_observed_fraction.csv`: observed-coverage target per sample
+- `probe_summary.tsv`: coverage probe summary (`coverage <- z`, `coverage <- z/||z||`)
+- `pc_coverage_corr.tsv`: PC/coverage correlations
+- `joined_data_<run_name>.csv`: per-sample coverage diagnostics
+- `norm_vs_coverage_scatter_<run_name>.png`: norm vs coverage scatter
 
 Coverage/batch confound monitors:
 
 - `coverage_latent_norm_corr`
 - `batch_latent_norm_r2` (if `--batch_labels_tsv` is provided)
 - `train_adv_mse`, `val_adv_mse`, `lambda_adv` (when adversarial coverage is enabled)
+- `lambda_cov`, `cov_penalty`, `val_cov_penalty`, `adv_steps_per_batch`
 - final `R²(coverage <- z)` and `R²(coverage <- z / ||z||)` in `run_summary.json`
+- final `corr_pc1_coverage` ... `corr_pc5_coverage` in `run_summary.json`
 
 ## Notes
 

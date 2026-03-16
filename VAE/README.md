@@ -103,3 +103,62 @@ Available W&B flags:
 - `--wandb_group`
 - `--wandb_tags` (comma-separated)
 - `--wandb_mode` (`online` or `offline`)
+
+## One-shot masked VAE
+
+This repo also includes a separate one-shot path for training a masked VAE on
+the full SNP vector of each individual from an existing genotype memmap. This
+does **not** replace the sparse `X.sparse` Phase 1 workflow above.
+
+### What it expects
+
+- A prepared memmap `meta.json` with the same schema used by the token-SNP
+  pipeline.
+- The default production input on HPC is:
+  `/work_beegfs/sunip956/aadr/token_snp/europe_filtered_token.meta.json`
+
+### What it does
+
+- Loads the full per-individual SNP vector in one forward pass
+- Uses a factorized chunked encoder/decoder so the model scales beyond a literal
+  dense all-SNP MLP
+- Applies masked categorical reconstruction over observed SNPs only
+- Exports run metrics, latent embeddings, and coverage leakage audits
+
+### Local CLI usage
+
+```bash
+python3 train_oneshot_masked_vae.py \
+  --meta_json /path/to/europe_filtered_token.meta.json \
+  --output_dir /path/to/vae_oneshot_run
+```
+
+Main outputs in `--output_dir`:
+
+- `config.json`
+- `splits.npz`
+- `metrics.jsonl`
+- `best_model.pt`
+- `run_summary.json`
+- `all_latents.csv`
+- `coverage_audit.json`
+- `pc_coverage_corr.tsv`
+
+### HPC usage
+
+The cluster script is generic across GPU types and intentionally does not hardcode
+an `L40` constraint.
+
+Preferred submit when H100 is available:
+
+```bash
+sbatch --constraint=H100 \
+  /work_beegfs/sunip956/Hiwi/DataFilter/cluster/caucluster/submit_vae_oneshot_europe.sbatch
+```
+
+Fallback submit on any compatible GPU node:
+
+```bash
+sbatch \
+  /work_beegfs/sunip956/Hiwi/DataFilter/cluster/caucluster/submit_vae_oneshot_europe.sbatch
+```

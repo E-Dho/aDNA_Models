@@ -76,6 +76,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Linear warmup epochs for lambda_adv from 0 to target.",
     )
     p.add_argument(
+        "--lambda_cov_target",
+        type=float,
+        default=0.0,
+        help="Target covariance penalty multiplier.",
+    )
+    p.add_argument(
+        "--adv_steps_per_batch",
+        type=int,
+        default=1,
+        help="Adversary-only optimization steps per main encoder step.",
+    )
+    p.add_argument(
+        "--lambda_ramp_start_epoch",
+        type=int,
+        default=6,
+        help="Epoch index where lambda_adv/lambda_cov ramp starts.",
+    )
+    p.add_argument(
+        "--lambda_ramp_end_epoch",
+        type=int,
+        default=15,
+        help="Epoch index where lambda_adv/lambda_cov reaches target.",
+    )
+    p.add_argument(
         "--adv_mlp_hidden_dim",
         type=int,
         default=128,
@@ -86,6 +110,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Dropout in coverage adversary MLP.",
+    )
+    p.add_argument(
+        "--coverage_conditioning_mode",
+        choices=("none", "concat", "film", "film_concat"),
+        default="none",
+        help="Coverage conditioning mode applied to the reconstruction pathway.",
+    )
+    p.add_argument(
+        "--coverage_embed_dim",
+        type=int,
+        default=0,
+        help="Optional coverage embedding width for concat conditioning (0=scalar).",
     )
     p.add_argument(
         "--batch_labels_tsv",
@@ -177,8 +213,14 @@ def main() -> None:
         adv_coverage_enable=bool(args.adv_coverage_enable),
         lambda_adv_target=args.lambda_adv_target,
         lambda_adv_warmup_epochs=args.lambda_adv_warmup_epochs,
+        lambda_cov_target=args.lambda_cov_target,
+        adv_steps_per_batch=args.adv_steps_per_batch,
+        lambda_ramp_start_epoch=args.lambda_ramp_start_epoch,
+        lambda_ramp_end_epoch=args.lambda_ramp_end_epoch,
         adv_mlp_hidden_dim=args.adv_mlp_hidden_dim,
         adv_mlp_dropout=args.adv_mlp_dropout,
+        coverage_conditioning_mode=args.coverage_conditioning_mode,
+        coverage_embed_dim=args.coverage_embed_dim,
         batch_labels_tsv=args.batch_labels_tsv,
         probe_eval_enable=bool(args.probe_eval_enable),
         probe_metadata_tsv=args.probe_metadata_tsv,
