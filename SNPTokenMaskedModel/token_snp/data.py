@@ -243,6 +243,9 @@ def build_random_window_batch(
     apply_mask: bool,
     apply_missingness_dropout: bool,
     device: "torch.device",
+    use_coverage_equalization: bool = False,
+    coverage_equalization_target: float = 0.30,
+    coverage_equalization_scope: str = "sample",
     window_starts: Optional[np.ndarray] = None,
 ) -> Dict[str, "torch.Tensor"]:
     import torch
@@ -300,6 +303,47 @@ def build_random_window_batch(
                 eligible_mask[bi, wi, :wlen] = observed.astype(np.float32)
                 snp_view[:] = start + np.arange(wlen, dtype=np.int64)
 
+    observed_pre = obs_mask > 0.5
+    orig_observed_fraction = observed_pre.mean(axis=2).astype(np.float32)
+
+    equalized_drop_fraction = np.zeros((bsz, windows_per_sample), dtype=np.float32)
+    if use_coverage_equalization:
+        if coverage_equalization_scope != "sample":
+            raise ValueError(
+                "Unsupported coverage_equalization_scope="
+                f"{coverage_equalization_scope!r}; only 'sample' is supported"
+            )
+        if not (0.0 <= coverage_equalization_target <= 1.0):
+            raise ValueError("coverage_equalization_target must be in [0, 1]")
+
+        observed_cur = obs_mask > 0.5
+        eps = 1e-12
+        for bi in range(bsz):
+            for wi in range(windows_per_sample):
+                observed_seq = observed_cur[bi, wi]
+                observed_fraction = float(orig_observed_fraction[bi, wi])
+                if observed_fraction <= coverage_equalization_target:
+                    continue
+                keep_prob = min(1.0, coverage_equalization_target / max(observed_fraction, eps))
+                if keep_prob >= 1.0:
+                    continue
+
+                drop_draw = rng.random(window_size)
+                dropped = observed_seq & (drop_draw > keep_prob)
+                if not dropped.any():
+                    continue
+
+                tokens[bi, wi, dropped] = missing_token
+                genotypes[bi, wi, dropped] = MISSING_VALUE
+                obs_mask[bi, wi, dropped] = 0.0
+                eligible_mask[bi, wi, dropped] = 0.0
+                dropped_count = int(dropped.sum())
+                observed_count = int(observed_seq.sum())
+                if observed_count > 0:
+                    equalized_drop_fraction[bi, wi] = float(dropped_count) / float(observed_count)
+
+    equalized_observed_fraction = (obs_mask > 0.5).mean(axis=2).astype(np.float32)
+
     if apply_mask:
         observed = obs_mask > 0.5
         mask_draw = rng.random(observed.shape)
@@ -348,5 +392,17 @@ def build_random_window_batch(
         ),
         "sample_idx": torch.from_numpy(sample_rep).to(device=device, dtype=torch.long),
         "window_start": torch.from_numpy(starts.reshape(n_seq)).to(device=device, dtype=torch.long),
+        "orig_observed_fraction": torch.from_numpy(orig_observed_fraction.reshape(n_seq)).to(
+            device=device,
+            dtype=torch.float32,
+        ),
+        "equalized_observed_fraction": torch.from_numpy(equalized_observed_fraction.reshape(n_seq)).to(
+            device=device,
+            dtype=torch.float32,
+        ),
+        "equalized_drop_fraction": torch.from_numpy(equalized_drop_fraction.reshape(n_seq)).to(
+            device=device,
+            dtype=torch.float32,
+        ),
     }
     return batch

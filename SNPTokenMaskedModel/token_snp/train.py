@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import socket
 import subprocess
@@ -50,6 +51,16 @@ class TrainConfig:
     patience: int = 5
     mask_prob: float = 0.2
     missingness_dropout: float = 0.1
+    use_coverage_equalization: bool = False
+    coverage_equalization_target: float = 0.30
+    coverage_equalization_scope: str = "sample"
+    use_group_rus: bool = False
+    group_rus_mode: str = "balanced_batch"
+    group_rus_max_per_group_in_batch: Optional[int] = None
+    group_rus_seed: int = 42
+    group_metadata_tsv: Optional[str] = None
+    group_metadata_col: str = "Group ID"
+    group_metadata_key: Optional[str] = None
     d_model: int = 128
     n_heads: int = 4
     local_layers: int = 2
@@ -60,6 +71,14 @@ class TrainConfig:
     latent_dim: int = 64
     latent_tokens: int = 8
     latent_feedback_mode: str = "cross_attn"
+    use_strong_latent_reconstruction: bool = False
+    latent_recon_mode: str = "film_plus_crossattn"
+    latent_recon_hidden_dim: Optional[int] = None
+    latent_recon_num_heads: int = 4
+    latent_recon_dropout: float = 0.05
+    latent_recon_num_tokens: int = 4
+    latent_cross_attn_residual_scale: float = 0.1
+    latent_only_aux_weight: float = 0.0
     use_obs_embedding: bool = True
     use_snp_id_embedding: bool = False
     embedding_batch_size: int = 128
@@ -97,6 +116,192 @@ class TrainConfig:
 def _sample_rows(rng: np.random.Generator, pool: np.ndarray, size: int) -> np.ndarray:
     picks = rng.integers(0, len(pool), size=size)
     return pool[picks]
+
+
+def _load_group_labels_from_metadata(
+    path: Path,
+    sample_ids: Sequence[str],
+    group_col: str,
+    metadata_key: Optional[str] = None,
+) -> Tuple[np.ndarray, Dict[int, str]]:
+    sid_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
+    labels = np.full(len(sample_ids), -1, dtype=np.int64)
+
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"Metadata file has no header: {path}")
+        resolved_key = metadata_key or reader.fieldnames[0]
+        if resolved_key not in reader.fieldnames:
+            raise ValueError(f"metadata_key '{resolved_key}' not found in {path}")
+        if group_col not in reader.fieldnames:
+            raise ValueError(f"group_metadata_col '{group_col}' not found in {path}")
+
+        group_to_id: Dict[str, int] = {}
+        next_id = 0
+        for row in reader:
+            raw_sid = (row.get(resolved_key) or "").strip()
+            if not raw_sid:
+                continue
+            idx = sid_to_idx.get(raw_sid)
+            if idx is None:
+                continue
+            raw_group = (row.get(group_col) or "").strip()
+            if not raw_group:
+                continue
+            gid = group_to_id.get(raw_group)
+            if gid is None:
+                gid = next_id
+                group_to_id[raw_group] = gid
+                next_id += 1
+            labels[idx] = gid
+
+    group_name_by_id = {gid: name for name, gid in group_to_id.items()}
+    return labels, group_name_by_id
+
+
+class BalancedGroupBatchSampler:
+    def __init__(
+        self,
+        train_indices: np.ndarray,
+        group_label_ids: np.ndarray,
+        group_name_by_id: Dict[int, str],
+        batch_size: int,
+        seed: int,
+        max_per_group_in_batch: Optional[int] = None,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if max_per_group_in_batch is not None and max_per_group_in_batch < 1:
+            raise ValueError("group_rus_max_per_group_in_batch must be >= 1 when set")
+
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.max_per_group_in_batch = max_per_group_in_batch
+        self.group_name_by_id = dict(group_name_by_id)
+
+        grouped: Dict[int, List[int]] = {}
+        for idx in train_indices.astype(np.int64).tolist():
+            gid = int(group_label_ids[int(idx)])
+            if gid < 0:
+                continue
+            grouped.setdefault(gid, []).append(int(idx))
+
+        if not grouped:
+            raise ValueError("BalancedGroupBatchSampler received no labeled training samples")
+
+        self.group_to_indices = {
+            gid: np.asarray(indices, dtype=np.int64)
+            for gid, indices in grouped.items()
+        }
+        self.active_groups = np.asarray(sorted(self.group_to_indices.keys()), dtype=np.int64)
+        self.n_active_groups = int(self.active_groups.shape[0])
+        if self.max_per_group_in_batch is not None and (
+            self.n_active_groups * self.max_per_group_in_batch < self.batch_size
+        ):
+            raise ValueError(
+                "group_rus_max_per_group_in_batch is too small to fill a batch: "
+                f"n_active_groups={self.n_active_groups}, cap={self.max_per_group_in_batch}, "
+                f"batch_size={self.batch_size}"
+            )
+
+        self.epoch_rng = np.random.default_rng(self.seed)
+        self.shuffled_group_to_indices: Dict[int, np.ndarray] = {}
+        self.group_cursors: Dict[int, int] = {}
+        self.last_batch_stats: Dict[str, float] = {}
+        self.epoch_group_counts: Counter = Counter()
+
+    def reset_epoch(self, epoch: int) -> None:
+        self.epoch_rng = np.random.default_rng(self.seed + int(epoch))
+        self.shuffled_group_to_indices = {}
+        self.group_cursors = {}
+        self.last_batch_stats = {}
+        self.epoch_group_counts = Counter()
+        for gid, indices in self.group_to_indices.items():
+            shuffled = indices.copy()
+            self.epoch_rng.shuffle(shuffled)
+            self.shuffled_group_to_indices[gid] = shuffled
+            self.group_cursors[gid] = 0
+
+    def _draw_from_group(self, gid: int, n: int) -> np.ndarray:
+        if n <= 0:
+            return np.empty((0,), dtype=np.int64)
+        drawn: List[np.ndarray] = []
+        remaining = int(n)
+        while remaining > 0:
+            pool = self.shuffled_group_to_indices[gid]
+            cursor = self.group_cursors[gid]
+            available = int(pool.shape[0] - cursor)
+            if available <= 0:
+                pool = self.group_to_indices[gid].copy()
+                self.epoch_rng.shuffle(pool)
+                self.shuffled_group_to_indices[gid] = pool
+                self.group_cursors[gid] = 0
+                cursor = 0
+                available = int(pool.shape[0])
+            take = min(remaining, available)
+            drawn.append(pool[cursor : cursor + take])
+            self.group_cursors[gid] = cursor + take
+            remaining -= take
+        return np.concatenate(drawn, axis=0)
+
+    def _allocate_counts(self, selected_groups: np.ndarray) -> Dict[int, int]:
+        n_groups = int(selected_groups.shape[0])
+        if self.max_per_group_in_batch is None:
+            base = self.batch_size // n_groups
+            remainder = self.batch_size % n_groups
+            counts = {int(gid): int(base) for gid in selected_groups.tolist()}
+            if remainder > 0:
+                extra_groups = self.epoch_rng.choice(selected_groups, size=remainder, replace=False)
+                for gid in extra_groups.tolist():
+                    counts[int(gid)] += 1
+            return counts
+
+        counts = {int(gid): 0 for gid in selected_groups.tolist()}
+        remaining = self.batch_size
+        while remaining > 0:
+            progressed = False
+            for gid in self.epoch_rng.permutation(selected_groups).tolist():
+                gid = int(gid)
+                if counts[gid] >= self.max_per_group_in_batch:
+                    continue
+                counts[gid] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+            if not progressed:
+                raise RuntimeError("Failed to allocate balanced batch counts under cap")
+        return counts
+
+    def sample_batch(self) -> np.ndarray:
+        n_groups = min(self.batch_size, self.n_active_groups)
+        selected_groups = self.epoch_rng.choice(self.active_groups, size=n_groups, replace=False)
+        counts = self._allocate_counts(selected_groups)
+
+        batch_parts: List[np.ndarray] = []
+        for gid, n_take in counts.items():
+            batch_parts.append(self._draw_from_group(gid, n_take))
+            self.epoch_group_counts[self.group_name_by_id[gid]] += int(n_take)
+
+        batch_idx = np.concatenate(batch_parts, axis=0)
+        self.epoch_rng.shuffle(batch_idx)
+
+        group_counts = np.asarray([count for count in counts.values() if count > 0], dtype=np.float64)
+        probs = group_counts / float(self.batch_size)
+        entropy = float(-(probs * np.log(probs)).sum()) if probs.size > 0 else float("nan")
+        self.last_batch_stats = {
+            "unique_group_ids": float(group_counts.shape[0]),
+            "max_group_fraction": float(group_counts.max() / float(self.batch_size)),
+            "group_entropy": entropy,
+        }
+        return batch_idx
+
+    def stats_for_last_batch(self) -> Dict[str, float]:
+        return dict(self.last_batch_stats)
+
+    def sampled_group_counts_epoch(self) -> Dict[str, int]:
+        return {str(k): int(v) for k, v in self.epoch_group_counts.items()}
 
 
 def _build_valid_mask(targets: torch.Tensor, n_classes: int) -> torch.Tensor:
@@ -435,6 +640,9 @@ def _encode_sample_embeddings(
                 apply_mask=False,
                 apply_missingness_dropout=False,
                 device=device,
+                use_coverage_equalization=False,
+                coverage_equalization_target=cfg.coverage_equalization_target,
+                coverage_equalization_scope=cfg.coverage_equalization_scope,
                 window_starts=starts,
             )
             out = model(
@@ -645,6 +853,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     metrics_path = out_dir / "metrics.jsonl"
     if metrics_path.exists():
         metrics_path.unlink()
+    group_rus_counts_path = out_dir / "group_rus_epoch_counts.jsonl"
+    if group_rus_counts_path.exists():
+        group_rus_counts_path.unlink()
 
     rng = np.random.default_rng(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -700,6 +911,13 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         latent_dim=cfg.latent_dim,
         latent_tokens=cfg.latent_tokens,
         latent_feedback_mode=cfg.latent_feedback_mode,
+        use_strong_latent_reconstruction=cfg.use_strong_latent_reconstruction,
+        latent_recon_mode=cfg.latent_recon_mode,
+        latent_recon_hidden_dim=cfg.latent_recon_hidden_dim,
+        latent_recon_num_heads=cfg.latent_recon_num_heads,
+        latent_recon_dropout=cfg.latent_recon_dropout,
+        latent_recon_num_tokens=cfg.latent_recon_num_tokens,
+        latent_cross_attn_residual_scale=cfg.latent_cross_attn_residual_scale,
         coverage_conditioning_mode=cfg.coverage_conditioning_mode,
         coverage_embed_dim=cfg.coverage_embed_dim,
         use_obs_embedding=cfg.use_obs_embedding,
@@ -801,6 +1019,50 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     )
     sample_ids = load_sample_ids(meta.sample_ids_path, meta.n_samples)
 
+    group_label_ids = None
+    group_name_by_id: Dict[int, str] = {}
+    group_sampler: Optional[BalancedGroupBatchSampler] = None
+    if cfg.use_group_rus:
+        if cfg.group_metadata_tsv is None:
+            raise ValueError("use_group_rus=True requires group_metadata_tsv to be set")
+        if cfg.group_rus_mode != "balanced_batch":
+            raise ValueError(
+                f"group_rus_mode={cfg.group_rus_mode!r} is not implemented; "
+                "only 'balanced_batch' is currently supported"
+            )
+
+        group_metadata_path = Path(cfg.group_metadata_tsv)
+        group_label_ids, group_name_by_id = _load_group_labels_from_metadata(
+            path=group_metadata_path,
+            sample_ids=sample_ids,
+            group_col=cfg.group_metadata_col,
+            metadata_key=cfg.group_metadata_key,
+        )
+        train_group_ids = group_label_ids[splits["train"]]
+        missing_mask = train_group_ids < 0
+        if np.any(missing_mask):
+            missing_indices = splits["train"][missing_mask][:10]
+            missing_samples = [sample_ids[int(i)] for i in missing_indices]
+            raise ValueError(
+                "use_group_rus=True but some training samples have no valid group label: "
+                f"missing_count={int(missing_mask.sum())}, examples={missing_samples}"
+            )
+        group_sampler = BalancedGroupBatchSampler(
+            train_indices=splits["train"],
+            group_label_ids=group_label_ids,
+            group_name_by_id=group_name_by_id,
+            batch_size=cfg.batch_size,
+            seed=cfg.group_rus_seed,
+            max_per_group_in_batch=cfg.group_rus_max_per_group_in_batch,
+        )
+        print(
+            "[INFO] group_rus "
+            f"enabled=1 mode={cfg.group_rus_mode} seed={cfg.group_rus_seed} "
+            f"metadata={cfg.group_metadata_tsv} key={cfg.group_metadata_key or '<first-column>'} "
+            f"group_col={cfg.group_metadata_col} n_groups={len(group_name_by_id)} "
+            f"cap={cfg.group_rus_max_per_group_in_batch}"
+        )
+
     # Step 5: split leakage diagnostics.
     train_set = set(splits["train"].tolist())
     val_set = set(splits["val"].tolist())
@@ -868,6 +1130,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         model.train()
         if coverage_adversary is not None:
             coverage_adversary.train()
+        if group_sampler is not None:
+            group_sampler.reset_epoch(epoch)
         lambda_adv_now = _scheduled_lambda(
             epoch=epoch,
             target=cfg.lambda_adv_target if adv_enabled else 0.0,
@@ -888,15 +1152,33 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         train_adv_count = 0
         train_cov_pen_sum = 0.0
         train_cov_pen_count = 0
+        train_latent_only_aux_sum = 0.0
+        train_latent_only_aux_count = 0
         train_eligible_total = 0
         train_masked_total = 0
+        train_orig_obs_sum = 0.0
+        train_equalized_obs_sum = 0.0
+        train_equalized_drop_sum = 0.0
+        train_equalization_count = 0
+        group_rus_unique_sum = 0.0
+        group_rus_max_frac_sum = 0.0
+        group_rus_entropy_sum = 0.0
+        group_rus_stat_count = 0
         train_hist: Counter = Counter()
         printed_train_examples = False
         epoch_lambda_adv = float(lambda_adv_now)
         epoch_lambda_cov = float(lambda_cov_now)
 
         for step_idx in range(cfg.steps_per_epoch):
-            batch_idx = _sample_rows(rng, splits["train"], cfg.batch_size)
+            if group_sampler is not None:
+                batch_idx = group_sampler.sample_batch()
+                rus_stats = group_sampler.stats_for_last_batch()
+                group_rus_unique_sum += float(rus_stats["unique_group_ids"])
+                group_rus_max_frac_sum += float(rus_stats["max_group_fraction"])
+                group_rus_entropy_sum += float(rus_stats["group_entropy"])
+                group_rus_stat_count += 1
+            else:
+                batch_idx = _sample_rows(rng, splits["train"], cfg.batch_size)
             batch = build_random_window_batch(
                 geno_mm=geno_mm,
                 sample_indices=batch_idx,
@@ -909,6 +1191,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 apply_mask=True,
                 apply_missingness_dropout=True,
                 device=device,
+                use_coverage_equalization=cfg.use_coverage_equalization,
+                coverage_equalization_target=cfg.coverage_equalization_target,
+                coverage_equalization_scope=cfg.coverage_equalization_scope,
             )
 
             cov_true = coverage_z_t[batch["sample_idx"]]
@@ -955,7 +1240,17 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             else:
                 adv_loss = recon_loss * 0.0
 
-            total_loss = recon_loss + adv_loss + (lambda_cov_now * cov_penalty)
+            aux_latent_only_loss = recon_loss * 0.0
+            aux_logits = out.get("aux_latent_only_logits")
+            if cfg.latent_only_aux_weight > 0.0 and aux_logits is not None:
+                aux_latent_only_loss, _ = _masked_recon_ce(aux_logits, batch["targets"], valid_mask)
+
+            total_loss = (
+                recon_loss
+                + adv_loss
+                + (lambda_cov_now * cov_penalty)
+                + (cfg.latent_only_aux_weight * aux_latent_only_loss)
+            )
 
             if cfg.debug_mode and (
                 cfg.debug_max_batches_per_phase < 0 or step_idx < cfg.debug_max_batches_per_phase
@@ -985,8 +1280,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             train_adv_count += 1
             train_cov_pen_sum += float(cov_penalty.detach().cpu().item())
             train_cov_pen_count += 1
+            train_latent_only_aux_sum += float(aux_latent_only_loss.detach().cpu().item())
+            train_latent_only_aux_count += 1
             train_eligible_total += n_eligible_maskable
             train_masked_total += n_masked_positions
+            train_orig_obs_sum += float(batch["orig_observed_fraction"].sum().detach().cpu().item())
+            train_equalized_obs_sum += float(batch["equalized_observed_fraction"].sum().detach().cpu().item())
+            train_equalized_drop_sum += float(batch["equalized_drop_fraction"].sum().detach().cpu().item())
+            train_equalization_count += int(batch["orig_observed_fraction"].numel())
             train_hist.update(_counter_from_tensor(batch["targets"][batch["train_mask"] > 0.5]))
 
             acc = _masked_accuracy(out["logits"], batch["targets"], valid_mask)
@@ -1013,7 +1314,29 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         train_acc = train_acc_sum / float(max(1, train_acc_count))
         train_adv_mse = train_adv_sum / float(max(1, train_adv_count))
         train_cov_penalty = train_cov_pen_sum / float(max(1, train_cov_pen_count))
+        train_latent_only_aux_ce = train_latent_only_aux_sum / float(max(1, train_latent_only_aux_count))
         train_masked_rate = float(train_masked_total) / float(max(1, train_eligible_total))
+        orig_observed_fraction_mean = train_orig_obs_sum / float(max(1, train_equalization_count))
+        equalized_observed_fraction_mean = train_equalized_obs_sum / float(max(1, train_equalization_count))
+        equalized_drop_fraction_mean = train_equalized_drop_sum / float(max(1, train_equalization_count))
+        if group_sampler is not None:
+            group_rus_unique_group_ids_mean = group_rus_unique_sum / float(max(1, group_rus_stat_count))
+            group_rus_max_group_fraction_mean = group_rus_max_frac_sum / float(max(1, group_rus_stat_count))
+            group_rus_group_entropy_mean = group_rus_entropy_sum / float(max(1, group_rus_stat_count))
+            with group_rus_counts_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "epoch": int(epoch),
+                            "counts": group_sampler.sampled_group_counts_epoch(),
+                        }
+                    )
+                    + "\n"
+                )
+        else:
+            group_rus_unique_group_ids_mean = float("nan")
+            group_rus_max_group_fraction_mean = float("nan")
+            group_rus_group_entropy_mean = float("nan")
 
         model.eval()
         if coverage_adversary is not None:
@@ -1026,6 +1349,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         val_adv_count = 0
         val_cov_pen_sum = 0.0
         val_cov_pen_count = 0
+        val_latent_only_aux_sum = 0.0
+        val_latent_only_aux_count = 0
+        val_loss_without_latent_sum = 0.0
+        val_masked_without_latent = 0
         val_eligible_total = 0
         val_masked_total = 0
         val_hist: Counter = Counter()
@@ -1046,6 +1373,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                     apply_mask=True,
                     apply_missingness_dropout=False,
                     device=device,
+                    use_coverage_equalization=False,
+                    coverage_equalization_target=cfg.coverage_equalization_target,
+                    coverage_equalization_scope=cfg.coverage_equalization_scope,
                 )
 
                 cov_true = coverage_z_t[batch["sample_idx"]]
@@ -1055,11 +1385,27 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                     snp_idx=batch["snp_idx"] if cfg.use_snp_id_embedding else None,
                     coverage_std=cov_true,
                 )
+                out_without_latent = model(
+                    tokens=batch["tokens"],
+                    obs_mask=batch["obs_mask"],
+                    snp_idx=batch["snp_idx"] if cfg.use_snp_id_embedding else None,
+                    coverage_std=cov_true,
+                    zero_pooled_latent_for_reconstruction=True,
+                )
                 valid_mask = _build_valid_mask(batch["targets"], meta.n_classes)
                 n_total_tokens = int(batch["tokens"].numel())
                 n_eligible_maskable = int((batch["eligible_mask"] > 0.5).sum().detach().cpu().item())
                 n_masked_positions = int((batch["train_mask"] > 0.5).sum().detach().cpu().item())
                 recon_loss, n_used_for_loss = _masked_recon_ce(out["logits"], batch["targets"], valid_mask)
+                recon_loss_without_latent, n_used_without_latent = _masked_recon_ce(
+                    out_without_latent["logits"],
+                    batch["targets"],
+                    valid_mask,
+                )
+                aux_latent_only_loss = recon_loss * 0.0
+                aux_logits = out.get("aux_latent_only_logits")
+                if cfg.latent_only_aux_weight > 0.0 and aux_logits is not None:
+                    aux_latent_only_loss, _ = _masked_recon_ce(aux_logits, batch["targets"], valid_mask)
                 if coverage_adversary is not None:
                     cov_pred = coverage_adversary(out["window_embedding"])
                     adv_loss = F.mse_loss(cov_pred, cov_true, reduction="mean")
@@ -1084,10 +1430,16 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
 
                 val_loss_sum += float(recon_loss.detach().cpu().item()) * n_used_for_loss
                 val_masked += n_used_for_loss
+                val_loss_without_latent_sum += (
+                    float(recon_loss_without_latent.detach().cpu().item()) * n_used_without_latent
+                )
+                val_masked_without_latent += n_used_without_latent
                 val_adv_sum += float(adv_loss.detach().cpu().item())
                 val_adv_count += 1
                 val_cov_pen_sum += float(cov_penalty.detach().cpu().item())
                 val_cov_pen_count += 1
+                val_latent_only_aux_sum += float(aux_latent_only_loss.detach().cpu().item())
+                val_latent_only_aux_count += 1
                 val_eligible_total += n_eligible_maskable
                 val_masked_total += n_masked_positions
                 val_hist.update(_counter_from_tensor(batch["targets"][batch["train_mask"] > 0.5]))
@@ -1113,10 +1465,13 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                     printed_val_examples = True
 
         val_ce = val_loss_sum / float(max(1, val_masked))
+        val_ce_without_latent = val_loss_without_latent_sum / float(max(1, val_masked_without_latent))
         val_acc = val_acc_sum / float(max(1, val_acc_count))
         val_adv_mse = val_adv_sum / float(max(1, val_adv_count))
         val_cov_penalty = val_cov_pen_sum / float(max(1, val_cov_pen_count))
+        val_latent_only_aux_ce = val_latent_only_aux_sum / float(max(1, val_latent_only_aux_count))
         val_masked_rate = float(val_masked_total) / float(max(1, val_eligible_total))
+        latent_usage_gap = float(val_ce_without_latent - val_ce)
 
         if cfg.debug_mode:
             train_hist_total = sum(train_hist.values())
@@ -1166,6 +1521,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "epoch": float(epoch),
             "train_ce": float(train_ce),
             "val_ce": float(val_ce),
+            "val_ce_with_latent": float(val_ce),
+            "val_ce_without_latent": float(val_ce_without_latent),
+            "latent_usage_gap": float(latent_usage_gap),
             "train_masked_acc": float(train_acc),
             "val_masked_acc": float(val_acc),
             "train_adv_mse": float(train_adv_mse),
@@ -1174,11 +1532,20 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "lambda_cov": float(epoch_lambda_cov if cov_penalty_enabled else 0.0),
             "cov_penalty": float(train_cov_penalty),
             "val_cov_penalty": float(val_cov_penalty),
+            "train_latent_only_aux_ce": float(train_latent_only_aux_ce),
+            "val_latent_only_aux_ce": float(val_latent_only_aux_ce),
+            "latent_only_aux_weight": float(cfg.latent_only_aux_weight),
             "adv_steps_per_batch": float(max(1, int(cfg.adv_steps_per_batch))),
             "train_masked_tokens": float(train_masked),
             "val_masked_tokens": float(val_masked),
             "train_masked_rate": float(train_masked_rate),
             "val_masked_rate": float(val_masked_rate),
+            "orig_observed_fraction_mean": float(orig_observed_fraction_mean),
+            "equalized_observed_fraction_mean": float(equalized_observed_fraction_mean),
+            "equalized_drop_fraction_mean": float(equalized_drop_fraction_mean),
+            "group_rus_unique_group_ids_mean": float(group_rus_unique_group_ids_mean),
+            "group_rus_max_group_fraction_mean": float(group_rus_max_group_fraction_mean),
+            "group_rus_group_entropy_mean": float(group_rus_group_entropy_mean),
             "coverage_latent_norm_corr": float(cov_corr),
             "batch_latent_norm_r2": float(batch_r2),
         }
@@ -1279,6 +1646,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     summary = {
         "best_epoch": int(best_epoch),
         "best_val_ce": float(best_val),
+        "final_val_ce": float(history[-1]["val_ce"]) if history else float("nan"),
+        "val_ce_with_latent": float(history[-1]["val_ce_with_latent"]) if history else float("nan"),
+        "val_ce_without_latent": float(history[-1]["val_ce_without_latent"]) if history else float("nan"),
+        "latent_usage_gap": float(history[-1]["latent_usage_gap"]) if history else float("nan"),
         "epochs_completed": len(history),
         "n_samples": meta.n_samples,
         "n_snps": meta.n_snps,
@@ -1288,6 +1659,25 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         "output_dir": str(out_dir),
         "model_config": asdict(model_cfg),
         "train_config": asdict(cfg),
+        "group_rus": {
+            "enabled": bool(cfg.use_group_rus),
+            "mode": cfg.group_rus_mode,
+            "seed": int(cfg.group_rus_seed),
+            "metadata_tsv": cfg.group_metadata_tsv,
+            "metadata_col": cfg.group_metadata_col,
+        },
+        "strong_latent_reconstruction": {
+            "enabled": bool(cfg.use_strong_latent_reconstruction),
+            "mode": cfg.latent_recon_mode,
+            "hidden_dim": cfg.latent_recon_hidden_dim,
+            "num_heads": int(cfg.latent_recon_num_heads),
+            "dropout": float(cfg.latent_recon_dropout),
+            "num_tokens": int(cfg.latent_recon_num_tokens),
+            "cross_attn_residual_scale": float(cfg.latent_cross_attn_residual_scale),
+            "latent_only_aux_weight": float(cfg.latent_only_aux_weight),
+            "train_latent_only_aux_ce": float(history[-1]["train_latent_only_aux_ce"]) if history else float("nan"),
+            "val_latent_only_aux_ce": float(history[-1]["val_latent_only_aux_ce"]) if history else float("nan"),
+        },
         "final_representation_metrics": {
             "coverage_corr_mean": float(coverage_corr_mean),
             "coverage_corr_concat": float(coverage_corr_concat),
@@ -1323,10 +1713,18 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             {
                 "best_epoch": best_epoch,
                 "best_val_ce": best_val,
+                "final_val_ce": float(history[-1]["val_ce"]) if history else float("nan"),
+                "val_ce_with_latent": float(history[-1]["val_ce_with_latent"]) if history else float("nan"),
+                "val_ce_without_latent": float(history[-1]["val_ce_without_latent"]) if history else float("nan"),
+                "latent_usage_gap": float(history[-1]["latent_usage_gap"]) if history else float("nan"),
                 "coverage_corr_mean": float(coverage_corr_mean),
                 "coverage_corr_concat": float(coverage_corr_concat),
                 "r2_coverage_from_z": float(r2_coverage_from_z),
                 "r2_coverage_from_z_unit": float(r2_coverage_from_z_unit),
+                "train_latent_only_aux_ce": float(history[-1]["train_latent_only_aux_ce"]) if history else float("nan"),
+                "val_latent_only_aux_ce": float(history[-1]["val_latent_only_aux_ce"]) if history else float("nan"),
+                "latent_only_aux_weight": float(cfg.latent_only_aux_weight),
+                "latent_cross_attn_residual_scale": float(cfg.latent_cross_attn_residual_scale),
                 **corr_pc_metrics,
                 **{f"coverage_corr_token_{k.split('_')[-1]}": float(v) for k, v in coverage_corr_tokens.items()},
                 **probe_log,

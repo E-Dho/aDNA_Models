@@ -24,7 +24,12 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Metadata field to color by; can be repeated",
     )
-    p.add_argument("--category_top_k", type=int, default=20, help="Top K categories to keep before grouping as Other")
+    p.add_argument(
+        "--category_top_k",
+        type=int,
+        default=0,
+        help="Top K categories to keep before grouping as Other; values <= 0 keep all categories",
+    )
     return p.parse_args()
 
 
@@ -37,6 +42,8 @@ def prepare_color_column(df: pd.DataFrame, col: str, top_k: int) -> pd.Series:
     if pd.api.types.is_numeric_dtype(s):
         return s
     filled = s.fillna("NA").astype(str)
+    if int(top_k) <= 0:
+        return filled
     vc = filled.value_counts()
     keep = set(vc.index[:top_k])
     return filled.where(filled.isin(keep), other="Other")

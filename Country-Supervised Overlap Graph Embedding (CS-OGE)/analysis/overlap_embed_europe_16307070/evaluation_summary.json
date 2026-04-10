@@ -1,0 +1,7 @@
+{
+  "coverage_r2": -0.01094415114472147,
+  "country_macro_knn_purity@15": 0.2608335688244121,
+  "original_group_knn_purity@15": 0.020196496488668794,
+  "date_neighbor_mae@15": 1441.3474295373537,
+  "date_neighbor_spearman": 0.793048353313201
+}

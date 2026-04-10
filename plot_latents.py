@@ -25,6 +25,11 @@ try:
 except ImportError:
     umap = None
 
+try:
+    import plotly.express as px
+except ImportError:
+    px = None
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -63,6 +68,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--point_size", type=float, default=10.0)
     parser.add_argument("--alpha", type=float, default=0.8)
+    parser.add_argument("--png_category_top_k", type=int, default=20)
+    parser.add_argument("--write_html", action="store_true", help="Also write interactive 2D HTML plots")
+    parser.add_argument(
+        "--html_category_top_k",
+        type=int,
+        default=0,
+        help="Top K categories to keep before grouping as Other in HTML; values <= 0 keep all categories",
+    )
     parser.add_argument("--umap_neighbors", type=int, default=30)
     parser.add_argument("--umap_min_dist", type=float, default=0.1)
     parser.add_argument("--tsne_perplexity", type=float, default=30.0)
@@ -147,6 +160,7 @@ def save_plot(
     output_path: Path,
     point_size: float,
     alpha: float,
+    category_top_k: int,
 ) -> None:
     plt.figure(figsize=(9, 7))
     series = frame[color_by]
@@ -164,9 +178,12 @@ def save_plot(
         plt.colorbar(scatter, label=color_by)
     else:
         filled = series.fillna("NA").astype(str)
-        counts = filled.value_counts()
-        keep = counts.index[:20]
-        grouped = filled.where(filled.isin(keep), other="Other")
+        if int(category_top_k) > 0:
+            counts = filled.value_counts()
+            keep = counts.index[: int(category_top_k)]
+            grouped = filled.where(filled.isin(keep), other="Other")
+        else:
+            grouped = filled
         for label in grouped.unique():
             mask = grouped == label
             plt.scatter(
@@ -191,6 +208,54 @@ def save_plot(
     plt.tight_layout()
     plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close()
+
+
+def prepare_categorical_series(series: pd.Series, category_top_k: int) -> pd.Series:
+    filled = series.fillna("NA").astype(str)
+    if int(category_top_k) <= 0:
+        return filled
+    counts = filled.value_counts()
+    keep = set(counts.index[: int(category_top_k)])
+    return filled.where(filled.isin(keep), other="Other")
+
+
+def save_html_plot(
+    frame: pd.DataFrame,
+    method: str,
+    color_by: str,
+    model_label: str,
+    output_path: Path,
+    point_size: float,
+    alpha: float,
+    category_top_k: int,
+) -> None:
+    if px is None:
+        raise RuntimeError("plotly is required for --write_html output")
+
+    html_frame = frame.copy()
+    color_col = color_by
+    if not pd.api.types.is_numeric_dtype(html_frame[color_by]):
+        color_col = f"_html_color_{sanitize_name(color_by)}"
+        html_frame[color_col] = prepare_categorical_series(html_frame[color_by], category_top_k)
+
+    hover_fields = [
+        col
+        for col in ("sample_id", color_by, "country", "original_group_id", "date_mean_bp", "observed_fraction")
+        if col in html_frame.columns
+    ]
+    fig = px.scatter(
+        html_frame,
+        x="dim1",
+        y="dim2",
+        color=color_col,
+        hover_name="sample_id" if "sample_id" in html_frame.columns else None,
+        hover_data=hover_fields,
+        title=f"{method.upper()} of {model_label} latents colored by {color_by}",
+        opacity=alpha,
+    )
+    fig.update_traces(marker={"size": point_size})
+    fig.update_layout(xaxis_title=f"{method.upper()} 1", yaxis_title=f"{method.upper()} 2")
+    fig.write_html(output_path, include_plotlyjs="cdn")
 
 
 def main() -> None:
@@ -233,7 +298,19 @@ def main() -> None:
                 output_path=output_dir / f"{method}_{sanitize_name(color_by)}.png",
                 point_size=args.point_size,
                 alpha=args.alpha,
+                category_top_k=args.png_category_top_k,
             )
+            if args.write_html:
+                save_html_plot(
+                    frame=frame,
+                    method=method,
+                    color_by=color_by,
+                    model_label=args.model_label,
+                    output_path=output_dir / f"{method}_{sanitize_name(color_by)}.html",
+                    point_size=args.point_size,
+                    alpha=args.alpha,
+                    category_top_k=args.html_category_top_k,
+                )
 
 
 if __name__ == "__main__":
