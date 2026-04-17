@@ -38,6 +38,8 @@ test_runs/
 **/merged_latents_metadata.csv
 
 # Large model/data artifacts
+*.anno
+*.tsv
 *.memmap
 *.pt
 *.pth
