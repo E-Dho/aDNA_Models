@@ -17,6 +17,7 @@ DATE_MEAN_COLUMN = (
 GENETIC_ID_PREFIX = "Genetic ID"
 GROUP_ID_COLUMN = "Group ID"
 ORIGINAL_GROUP_ID_COLUMN = "Original Group ID"
+POLITICAL_ENTITY_COLUMN = "Political Entity"
 
 
 @dataclass(frozen=True)
@@ -294,13 +295,30 @@ def build_sample_stats_rows(
         meta = anno_index.get(sample_id, {})
         group_key = _resolve_column_name(meta, GROUP_ID_COLUMN)
         original_group_key = _resolve_column_name(meta, ORIGINAL_GROUP_ID_COLUMN)
+        political_entity_key = _resolve_column_name(meta, POLITICAL_ENTITY_COLUMN)
         date_key = _resolve_column_name(meta, DATE_MEAN_COLUMN, "Date mean in BP")
+        group_value = _clean_value(meta.get(group_key) if group_key else None)
+        original_group_value = _clean_value(meta.get(original_group_key) if original_group_key else None)
+        political_entity_value = _clean_value(meta.get(political_entity_key) if political_entity_key else None)
+
+        # Some group-id filtered datasets intentionally omit "Original Group ID" and
+        # use "Group ID" as the fine-grained label. In that case, keep a country-like
+        # field via "Political Entity" when available.
+        if not original_group_value and group_value:
+            original_group_value = group_value
+            if political_entity_value:
+                country_value = political_entity_value
+            else:
+                country_value = group_value
+        else:
+            country_value = group_value
+
         rows.append(
             {
                 "sample_id": sample_id,
                 "observed_fraction": float(observed_fraction[idx]),
-                "country": _clean_value(meta.get(group_key) if group_key else None),
-                "original_group_id": _clean_value(meta.get(original_group_key) if original_group_key else None),
+                "country": country_value,
+                "original_group_id": original_group_value,
                 "date_mean_bp": _parse_optional_float(meta.get(date_key) if date_key else None),
             }
         )

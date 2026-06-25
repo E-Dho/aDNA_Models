@@ -62,6 +62,26 @@ class PrepareMemmapTests(unittest.TestCase):
             self.assertEqual(stats[1]["original_group_id"], "B_1")
             self.assertEqual(stats[0]["date_mean_bp"], 1000.0)
 
+    def test_group_id_dataset_falls_back_to_group_id_for_original_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            anno = root / "groupid.anno"
+            anno.write_text(
+                (
+                    '"Genetic ID (suffixes: "".DG"" is a high coverage shotgun genome)"\t'
+                    "Group ID\tPolitical Entity\t"
+                    "Date mean in BP in years before 1950 CE [OxCal mu for a direct radiocarbon date, and average of range for a contextual date]\n"
+                    "s1\tHungary_Avar.AG\tHungary\t1200\n"
+                    "s2\tSweden_Viking.SG\tSweden\t1000\n"
+                ),
+                encoding="utf-8",
+            )
+            stats = build_sample_stats_rows(["s1", "s2"], np.asarray([0.4, 0.5], dtype=np.float32), anno)
+            self.assertEqual(stats[0]["country"], "Hungary")
+            self.assertEqual(stats[0]["original_group_id"], "Hungary_Avar.AG")
+            self.assertEqual(stats[1]["country"], "Sweden")
+            self.assertEqual(stats[1]["original_group_id"], "Sweden_Viking.SG")
+
 
 if __name__ == "__main__":
     unittest.main()

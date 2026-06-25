@@ -69,6 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on samples drawn from one group within a train batch.",
     )
     p.add_argument(
+        "--group_rus_groups_per_batch",
+        type=int,
+        default=None,
+        help="Optional number of Group-ID classes selected per train batch.",
+    )
+    p.add_argument(
         "--group_rus_seed",
         type=int,
         default=42,
@@ -88,6 +94,68 @@ def build_parser() -> argparse.ArgumentParser:
         "--group_metadata_key",
         default=None,
         help="Metadata key column used to join sample IDs; defaults to the first metadata column.",
+    )
+    p.add_argument(
+        "--use_country_loss",
+        action="store_true",
+        help="Enable supervised pairwise country loss on pooled latent z.",
+    )
+    p.add_argument(
+        "--lambda_country_loss_target",
+        type=float,
+        default=0.1,
+        help="Target weight for country_loss after ramp.",
+    )
+    p.add_argument(
+        "--country_loss_pos_margin",
+        type=float,
+        default=0.25,
+        help="Same-country hinge margin for pairwise country loss.",
+    )
+    p.add_argument(
+        "--country_loss_neg_margin",
+        type=float,
+        default=1.0,
+        help="Different-country hinge margin for pairwise country loss.",
+    )
+    p.add_argument(
+        "--country_loss_normalize_z",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize pooled z before pairwise country loss.",
+    )
+    p.add_argument(
+        "--country_loss_ramp_start_epoch",
+        type=int,
+        default=1,
+        help="Epoch where country-loss weight ramp starts.",
+    )
+    p.add_argument(
+        "--country_loss_ramp_end_epoch",
+        type=int,
+        default=10,
+        help="Epoch where country-loss weight reaches target.",
+    )
+    p.add_argument(
+        "--country_loss_groups_per_batch",
+        type=int,
+        default=None,
+        help="Expected Group-RUS groups per train batch for country-loss positive pairs.",
+    )
+    p.add_argument(
+        "--country_loss_metadata_tsv",
+        default=None,
+        help="Metadata TSV/ANNO used to resolve sample_id -> country label for country loss.",
+    )
+    p.add_argument(
+        "--country_loss_metadata_col",
+        default="Group ID",
+        help="Metadata column used as country label for country loss.",
+    )
+    p.add_argument(
+        "--country_loss_metadata_key",
+        default=None,
+        help="Metadata key column for country loss; defaults to the first metadata column.",
     )
 
     p.add_argument("--d_model", type=int, default=128)
@@ -301,10 +369,22 @@ def main() -> None:
         use_group_rus=bool(args.use_group_rus),
         group_rus_mode=args.group_rus_mode,
         group_rus_max_per_group_in_batch=args.group_rus_max_per_group_in_batch,
+        group_rus_groups_per_batch=args.group_rus_groups_per_batch,
         group_rus_seed=args.group_rus_seed,
         group_metadata_tsv=args.group_metadata_tsv,
         group_metadata_col=args.group_metadata_col,
         group_metadata_key=args.group_metadata_key,
+        use_country_loss=bool(args.use_country_loss),
+        lambda_country_loss_target=args.lambda_country_loss_target,
+        country_loss_pos_margin=args.country_loss_pos_margin,
+        country_loss_neg_margin=args.country_loss_neg_margin,
+        country_loss_normalize_z=bool(args.country_loss_normalize_z),
+        country_loss_ramp_start_epoch=args.country_loss_ramp_start_epoch,
+        country_loss_ramp_end_epoch=args.country_loss_ramp_end_epoch,
+        country_loss_groups_per_batch=args.country_loss_groups_per_batch,
+        country_loss_metadata_tsv=args.country_loss_metadata_tsv,
+        country_loss_metadata_col=args.country_loss_metadata_col,
+        country_loss_metadata_key=args.country_loss_metadata_key,
         d_model=args.d_model,
         n_heads=args.n_heads,
         local_layers=args.local_layers,

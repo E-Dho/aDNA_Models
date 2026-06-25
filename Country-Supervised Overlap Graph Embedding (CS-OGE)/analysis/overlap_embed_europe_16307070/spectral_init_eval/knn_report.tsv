@@ -1,6 +1,0 @@
-metric	value
-coverage_r2	0.2861236026262681
-country_macro_knn_purity@15	0.21965398743531994
-original_group_knn_purity@15	0.014807053463316582
-date_neighbor_mae@15	1455.5482085767833
-date_neighbor_spearman	0.7833371662915094

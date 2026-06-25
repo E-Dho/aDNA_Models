@@ -10,6 +10,12 @@ from .data import (
     read_anno_rows,
     save_meta,
 )
+from .oos_encoder import (
+    align_eigenstrat_to_manifest,
+    load_snp_manifest,
+    prefixed_path,
+    write_snp_manifest,
+)
 
 __all__ = [
     "GenotypeMemmapMeta",
@@ -20,4 +26,8 @@ __all__ = [
     "open_genotype_memmap",
     "read_anno_rows",
     "save_meta",
+    "align_eigenstrat_to_manifest",
+    "load_snp_manifest",
+    "prefixed_path",
+    "write_snp_manifest",
 ]

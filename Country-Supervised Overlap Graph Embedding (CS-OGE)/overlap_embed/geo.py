@@ -433,6 +433,136 @@ def _color_values(frame: pd.DataFrame, color_col: Optional[str]) -> tuple[Any, O
     return colors, color_col, False
 
 
+def compute_arrow_density_alpha(
+    x: Sequence[float],
+    y: Sequence[float],
+    dx: Sequence[float],
+    dy: Sequence[float],
+    *,
+    alpha_min: float = 0.05,
+    alpha_max: float = 0.65,
+    grid_size: int = 120,
+) -> np.ndarray:
+    """Return per-arrow alpha from midpoint density on a deterministic 2D grid."""
+    x_arr = np.asarray(x, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64)
+    dx_arr = np.asarray(dx, dtype=np.float64)
+    dy_arr = np.asarray(dy, dtype=np.float64)
+    if not (x_arr.shape == y_arr.shape == dx_arr.shape == dy_arr.shape):
+        raise ValueError("x, y, dx, and dy must have matching shapes")
+    if x_arr.size == 0:
+        return np.asarray([], dtype=np.float64)
+
+    lo = float(min(alpha_min, alpha_max))
+    hi = float(max(alpha_min, alpha_max))
+    mid_x = x_arr + 0.5 * dx_arr
+    mid_y = y_arr + 0.5 * dy_arr
+    finite = np.isfinite(mid_x) & np.isfinite(mid_y)
+    if not finite.any():
+        return np.full(x_arr.shape, lo, dtype=np.float64)
+
+    grid = max(int(grid_size), 2)
+    x_edges = np.linspace(float(np.nanmin(mid_x[finite])), float(np.nanmax(mid_x[finite])), grid + 1)
+    y_edges = np.linspace(float(np.nanmin(mid_y[finite])), float(np.nanmax(mid_y[finite])), grid + 1)
+    if np.isclose(x_edges[0], x_edges[-1]):
+        x_edges = np.asarray([x_edges[0] - 0.5, x_edges[0] + 0.5], dtype=np.float64)
+    if np.isclose(y_edges[0], y_edges[-1]):
+        y_edges = np.asarray([y_edges[0] - 0.5, y_edges[0] + 0.5], dtype=np.float64)
+
+    hist, _, _ = np.histogram2d(mid_x[finite], mid_y[finite], bins=(x_edges, y_edges))
+    x_bin = np.clip(np.searchsorted(x_edges, mid_x, side="right") - 1, 0, hist.shape[0] - 1)
+    y_bin = np.clip(np.searchsorted(y_edges, mid_y, side="right") - 1, 0, hist.shape[1] - 1)
+    density = hist[x_bin, y_bin].astype(np.float64)
+    density[~finite] = 1.0
+
+    low = float(np.percentile(density[finite], 5))
+    high = float(np.percentile(density[finite], 95))
+    if high <= low:
+        return np.full(x_arr.shape, (lo + hi) / 2.0, dtype=np.float64)
+    normalized = np.clip((density - low) / (high - low), 0.0, 1.0)
+    return lo + normalized * (hi - lo)
+
+
+def _draw_quiver_with_alpha_bins(
+    ax: Any,
+    x: np.ndarray,
+    y: np.ndarray,
+    dx: np.ndarray,
+    dy: np.ndarray,
+    alpha_values: np.ndarray,
+    *,
+    n_bins: int = 8,
+) -> None:
+    if x.size == 0:
+        return
+    lo = float(np.nanmin(alpha_values))
+    hi = float(np.nanmax(alpha_values))
+    if not np.isfinite(lo) or not np.isfinite(hi) or np.isclose(lo, hi):
+        bins = np.asarray([lo - 0.5, hi + 0.5], dtype=np.float64)
+    else:
+        bins = np.linspace(lo, hi, max(int(n_bins), 1) + 1)
+    for idx in range(len(bins) - 1):
+        if idx == len(bins) - 2:
+            mask = (alpha_values >= bins[idx]) & (alpha_values <= bins[idx + 1])
+        else:
+            mask = (alpha_values >= bins[idx]) & (alpha_values < bins[idx + 1])
+        if not mask.any():
+            continue
+        alpha = float(np.nanmean(alpha_values[mask]))
+        ax.quiver(
+            x[mask],
+            y[mask],
+            dx[mask],
+            dy[mask],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            width=0.002,
+            alpha=alpha,
+            color="black",
+        )
+
+
+def _matched_point_colors(
+    frame: pd.DataFrame,
+    *,
+    mode: str = "sample",
+    label_col: Optional[str] = None,
+    time_col: Optional[str] = None,
+) -> np.ndarray:
+    n = int(len(frame))
+    if mode not in {"sample", "label", "time", "fixed"}:
+        raise ValueError("aligned_color_mode must be one of: sample, label, time, fixed")
+    if mode == "fixed" or n == 0:
+        return np.tile(np.asarray(matplotlib.colors.to_rgba("#4c78a8")), (n, 1))
+    if mode == "label" and label_col and label_col in frame.columns:
+        labels = frame[label_col].fillna("NA").astype(str)
+        unique = {label: idx for idx, label in enumerate(sorted(labels.unique().tolist()))}
+        codes = labels.map(unique).to_numpy(dtype=np.int64)
+        cmap = plt.get_cmap("tab20" if len(unique) <= 20 else "turbo")
+        denom = max(len(unique) - 1, 1)
+        return np.asarray([cmap(int(code) / denom) for code in codes], dtype=np.float64)
+    if mode == "time" and time_col and time_col in frame.columns:
+        values = pd.to_numeric(frame[time_col], errors="coerce").to_numpy(dtype=np.float64)
+        finite = np.isfinite(values)
+        if finite.any() and float(np.nanmax(values[finite])) > float(np.nanmin(values[finite])):
+            norm = (values - float(np.nanmin(values[finite]))) / (
+                float(np.nanmax(values[finite])) - float(np.nanmin(values[finite]))
+            )
+            norm[~finite] = 0.5
+            return np.asarray(plt.get_cmap("viridis")(np.clip(norm, 0.0, 1.0)), dtype=np.float64)
+    positions = np.linspace(0.0, 1.0, max(n, 2))[:n]
+    return np.asarray(plt.get_cmap("turbo")(positions), dtype=np.float64)
+
+
+def _with_alpha(colors: np.ndarray, alpha: float) -> np.ndarray:
+    out = np.asarray(colors, dtype=np.float64).copy()
+    if out.ndim != 2 or out.shape[1] != 4:
+        raise ValueError("colors must be an RGBA array with shape (n, 4)")
+    out[:, 3] = float(alpha)
+    return out
+
+
 def plot_distortion_map(
     distortion_frame: pd.DataFrame,
     *,
@@ -441,8 +571,13 @@ def plot_distortion_map(
     plot_arrows: int | bool = True,
     plot_labels: int | bool = False,
     arrow_scale: Optional[float] = None,
+    arrow_alpha_mode: str = "density",
+    arrow_alpha_min: float = 0.05,
+    arrow_alpha_max: float = 0.65,
     title: str = "Genetic distortion map",
 ) -> None:
+    if arrow_alpha_mode not in {"density", "fixed"}:
+        raise ValueError("arrow_alpha_mode must be one of: density, fixed")
     fig, ax = plt.subplots(figsize=(9.5, 8.0))
     colors, color_label, numeric = _color_values(distortion_frame, color_col)
     scatter = ax.scatter(
@@ -457,21 +592,36 @@ def plot_distortion_map(
     if numeric and color_label:
         fig.colorbar(scatter, ax=ax, label=color_label)
     if _as_bool(plot_arrows):
+        x = distortion_frame["projected_x"].to_numpy(dtype=np.float64)
+        y = distortion_frame["projected_y"].to_numpy(dtype=np.float64)
         dx = distortion_frame["dx"].to_numpy(dtype=np.float64)
         dy = distortion_frame["dy"].to_numpy(dtype=np.float64)
         scale = 1.0 if arrow_scale is None else float(arrow_scale)
-        ax.quiver(
-            distortion_frame["projected_x"],
-            distortion_frame["projected_y"],
-            dx * scale,
-            dy * scale,
-            angles="xy",
-            scale_units="xy",
-            scale=1,
-            width=0.002,
-            alpha=0.55,
-            color="black",
-        )
+        dx_scaled = dx * scale
+        dy_scaled = dy * scale
+        if arrow_alpha_mode == "density":
+            alpha_values = compute_arrow_density_alpha(
+                x,
+                y,
+                dx_scaled,
+                dy_scaled,
+                alpha_min=arrow_alpha_min,
+                alpha_max=arrow_alpha_max,
+            )
+            _draw_quiver_with_alpha_bins(ax, x, y, dx_scaled, dy_scaled, alpha_values)
+        else:
+            ax.quiver(
+                x,
+                y,
+                dx_scaled,
+                dy_scaled,
+                angles="xy",
+                scale_units="xy",
+                scale=1,
+                width=0.002,
+                alpha=float(arrow_alpha_max),
+                color="black",
+            )
     if _as_bool(plot_labels):
         for _, row in distortion_frame.iterrows():
             ax.text(row["projected_x"], row["projected_y"], str(row["sample_id"]), fontsize=5, alpha=0.65)
@@ -485,10 +635,58 @@ def plot_distortion_map(
     plt.close(fig)
 
 
-def _plot_aligned_vs_true(distortion_frame: pd.DataFrame, output_path: Path) -> None:
+def _plot_aligned_vs_true(
+    distortion_frame: pd.DataFrame,
+    output_path: Path,
+    *,
+    aligned_color_mode: str = "sample",
+    label_col: Optional[str] = None,
+    time_col: Optional[str] = None,
+) -> None:
     fig, ax = plt.subplots(figsize=(9.0, 8.0))
-    ax.scatter(distortion_frame["projected_x"], distortion_frame["projected_y"], s=14, alpha=0.75, label="true geography")
-    ax.scatter(distortion_frame["aligned_x"], distortion_frame["aligned_y"], s=14, alpha=0.75, label="aligned latent")
+    if aligned_color_mode == "fixed":
+        ax.scatter(
+            distortion_frame["projected_x"],
+            distortion_frame["projected_y"],
+            s=14,
+            alpha=0.75,
+            color="#1f77b4",
+            label="true geography",
+        )
+        ax.scatter(
+            distortion_frame["aligned_x"],
+            distortion_frame["aligned_y"],
+            s=14,
+            alpha=0.75,
+            color="#ff7f0e",
+            label="aligned latent",
+        )
+    else:
+        colors = _matched_point_colors(
+            distortion_frame,
+            mode=aligned_color_mode,
+            label_col=label_col,
+            time_col=time_col,
+        )
+        ax.scatter(
+            distortion_frame["projected_x"],
+            distortion_frame["projected_y"],
+            s=13,
+            c=_with_alpha(colors, 0.82),
+            marker="o",
+            linewidths=0,
+            label="true geography",
+        )
+        ax.scatter(
+            distortion_frame["aligned_x"],
+            distortion_frame["aligned_y"],
+            s=28,
+            facecolors="none",
+            edgecolors=_with_alpha(colors, 0.55),
+            marker="o",
+            linewidths=0.75,
+            label="aligned latent",
+        )
     ax.set_aspect("equal", adjustable="datalim")
     ax.set_xlabel("Projected x")
     ax.set_ylabel("Projected y")
@@ -571,6 +769,10 @@ def run_distortion_pipeline(
     plot_arrows: int | bool = True,
     plot_labels: int | bool = False,
     arrow_scale: Optional[float] = None,
+    arrow_alpha_mode: str = "density",
+    arrow_alpha_min: float = 0.05,
+    arrow_alpha_max: float = 0.65,
+    aligned_color_mode: str = "label",
     knn_k: int = 15,
     seed: int = 0,
 ) -> Dict[str, Any]:
@@ -649,8 +851,17 @@ def run_distortion_pipeline(
         plot_arrows=plot_arrows,
         plot_labels=plot_labels,
         arrow_scale=arrow_scale,
+        arrow_alpha_mode=arrow_alpha_mode,
+        arrow_alpha_min=arrow_alpha_min,
+        arrow_alpha_max=arrow_alpha_max,
     )
-    _plot_aligned_vs_true(distortion, out_dir / "aligned_vs_true.png")
+    _plot_aligned_vs_true(
+        distortion,
+        out_dir / "aligned_vs_true.png",
+        aligned_color_mode=aligned_color_mode,
+        label_col=label_col,
+        time_col=time_col,
+    )
     _plot_distortion_histogram(distortion, out_dir / "distortion_histogram.png")
     _plot_distance_correlation(reduction.coords, projection.xy, metrics, out_dir / "distance_correlation.png", seed=seed)
 

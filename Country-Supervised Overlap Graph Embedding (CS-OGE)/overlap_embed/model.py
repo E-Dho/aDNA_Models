@@ -72,11 +72,29 @@ def positive_edge_loss(latents, src, dst, weight):
     return weighted.mean()
 
 
+def graph_similarity_loss(latents, src, dst, target_weight, temperature: float):
+    diff = latents[src] - latents[dst]
+    dist2 = diff.pow(2).sum(dim=1)
+    temp = max(float(temperature), 1e-6)
+    latent_similarity = (-dist2 / temp).exp()
+    return (latent_similarity - target_weight).pow(2).mean()
+
+
 def negative_edge_loss(latents, src, neg_dst, margin: float):
     torch, _ = require_torch()
     diff = latents[src] - latents[neg_dst]
     dist = torch.sqrt(diff.pow(2).sum(dim=1) + 1e-8)
     return torch.relu(float(margin) - dist).pow(2).mean()
+
+
+def nonedge_margin_violation_rate(latents, src, neg_dst, margin: float) -> float:
+    torch, _ = require_torch()
+    if src.numel() == 0:
+        return 0.0
+    with torch.no_grad():
+        diff = latents[src] - latents[neg_dst]
+        dist = torch.sqrt(diff.pow(2).sum(dim=1) + 1e-8)
+        return float((dist < float(margin)).float().mean().detach().cpu())
 
 
 def snapshot_state(best_epoch: int, best_val_loss: float, n_epochs_completed: int) -> Dict[str, float]:

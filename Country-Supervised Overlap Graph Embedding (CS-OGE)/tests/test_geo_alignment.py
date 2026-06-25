@@ -10,7 +10,10 @@ import numpy as np
 import pandas as pd
 
 from overlap_embed.geo import (
+    _matched_point_colors,
+    _with_alpha,
     apply_similarity_transform,
+    compute_arrow_density_alpha,
     compute_distortion_metrics,
     compute_distortion_vectors,
     fit_similarity_transform,
@@ -171,7 +174,47 @@ class GeoAlignmentTests(unittest.TestCase):
             metrics = json.loads((out / "distortion_metrics.json").read_text(encoding="utf-8"))
             self.assertEqual(metrics["n_samples"], 12)
 
+    def test_arrow_density_alpha_increases_for_crowded_midpoints(self) -> None:
+        x = np.asarray([0.0, 0.02, 0.04, 10.0])
+        y = np.asarray([0.0, 0.02, 0.04, 10.0])
+        dx = np.asarray([0.2, 0.2, 0.2, 0.2])
+        dy = np.zeros_like(dx)
+        alpha = compute_arrow_density_alpha(
+            x,
+            y,
+            dx,
+            dy,
+            alpha_min=0.05,
+            alpha_max=0.65,
+            grid_size=4,
+        )
+        self.assertEqual(alpha.shape, (4,))
+        self.assertGreaterEqual(float(alpha.min()), 0.05)
+        self.assertLessEqual(float(alpha.max()), 0.65)
+        self.assertGreater(float(alpha[0]), float(alpha[-1]))
+
+    def test_matched_sample_colors_keep_true_and_aligned_rgb_equal(self) -> None:
+        frame = pd.DataFrame({"sample_id": [f"s{i}" for i in range(6)]})
+        colors = _matched_point_colors(frame, mode="sample")
+        true_colors = _with_alpha(colors, 0.82)
+        aligned_colors = _with_alpha(colors, 0.55)
+        self.assertEqual(colors.shape, (6, 4))
+        np.testing.assert_allclose(true_colors[:, :3], aligned_colors[:, :3])
+        self.assertTrue(np.allclose(true_colors[:, 3], 0.82))
+        self.assertTrue(np.allclose(aligned_colors[:, 3], 0.55))
+
+    def test_matched_label_colors_are_shared_within_country(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "sample_id": ["a1", "a2", "b1", "b2"],
+                "country": ["A", "A", "B", "B"],
+            }
+        )
+        colors = _matched_point_colors(frame, mode="label", label_col="country")
+        np.testing.assert_allclose(colors[0], colors[1])
+        np.testing.assert_allclose(colors[2], colors[3])
+        self.assertGreater(float(np.abs(colors[0] - colors[2]).sum()), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
-

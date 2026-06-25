@@ -105,15 +105,80 @@ def nearest_neighbors(latents: np.ndarray, k: int) -> np.ndarray:
     return idx[row, order]
 
 
-def macro_knn_purity(labels: Sequence[str], neighbors: np.ndarray) -> float:
+def nearest_neighbors_with_distances(latents: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    dist2 = pairwise_sq_dist(latents)
+    np.fill_diagonal(dist2, np.inf)
+    k = min(int(k), latents.shape[0] - 1)
+    idx = np.argpartition(dist2, kth=k, axis=1)[:, :k]
+    row = np.arange(latents.shape[0])[:, None]
+    order = np.argsort(dist2[row, idx], axis=1)
+    sorted_idx = idx[row, order]
+    sorted_dist2 = dist2[row, sorted_idx]
+    return sorted_idx, sorted_dist2
+
+
+def macro_knn_purity(
+    labels: Sequence[str],
+    neighbors: np.ndarray,
+    *,
+    min_group_size: int = 1,
+) -> float:
     labels_arr = np.asarray(labels, dtype=object)
+    label_counts: Dict[str, int] = {}
+    for raw_label in labels_arr:
+        label = str(raw_label)
+        if label:
+            label_counts[label] = label_counts.get(label, 0) + 1
     per_label: Dict[str, List[float]] = {}
     for i in range(labels_arr.shape[0]):
         label = str(labels_arr[i])
         if not label:
             continue
+        if label_counts.get(label, 0) < int(min_group_size):
+            continue
         purity = float((labels_arr[neighbors[i]] == label).mean())
         per_label.setdefault(label, []).append(purity)
+    if not per_label:
+        return float("nan")
+    return float(np.mean([np.mean(values) for values in per_label.values()]))
+
+
+def adaptive_group_knn_purity(
+    labels: Sequence[str],
+    neighbors: np.ndarray,
+    neighbor_dist2: np.ndarray,
+    *,
+    min_group_size: int = 1,
+) -> float:
+    labels_arr = np.asarray(labels, dtype=object)
+    per_label: Dict[str, List[float]] = {}
+    label_counts: Dict[str, int] = {}
+    for raw_label in labels_arr:
+        label = str(raw_label)
+        if label:
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+    for i in range(labels_arr.shape[0]):
+        label = str(labels_arr[i])
+        if not label:
+            continue
+        if label_counts.get(label, 0) < int(min_group_size):
+            continue
+
+        same_mask = labels_arr[neighbors[i]] == label
+        same_count = int(same_mask.sum())
+        available_same = max(label_counts.get(label, 0) - 1, 0)
+        purity = float(same_count / max(neighbors.shape[1], 1))
+
+        if 0 < available_same <= neighbors.shape[1] and same_count == available_same:
+            furthest_same_dist2 = float(np.max(neighbor_dist2[i][same_mask]))
+            keep_mask = same_mask | (neighbor_dist2[i] <= furthest_same_dist2)
+            kept = int(keep_mask.sum())
+            if kept > 0:
+                purity = float(same_count / kept)
+
+        per_label.setdefault(label, []).append(purity)
+
     if not per_label:
         return float("nan")
     return float(np.mean([np.mean(values) for values in per_label.values()]))
@@ -250,11 +315,27 @@ def evaluate_embedding(
     original_group = [str(row["original_group_id"]) for row in rows]
     dates = np.asarray([float(row["date_mean_bp"]) for row in rows], dtype=np.float64)
 
-    neighbors = nearest_neighbors(latents, k)
+    neighbors, neighbor_dist2 = nearest_neighbors_with_distances(latents, k)
     metrics = {
         "coverage_r2": ridge_probe_r2(latents, coverage),
         "country_macro_knn_purity@15": macro_knn_purity(country, neighbors),
         "original_group_knn_purity@15": macro_knn_purity(original_group, neighbors),
+        "original_group_knn_purity@15_non_singleton": macro_knn_purity(
+            original_group,
+            neighbors,
+            min_group_size=2,
+        ),
+        "original_group_adaptive_knn_purity@15": adaptive_group_knn_purity(
+            original_group,
+            neighbors,
+            neighbor_dist2,
+        ),
+        "original_group_adaptive_knn_purity@15_non_singleton": adaptive_group_knn_purity(
+            original_group,
+            neighbors,
+            neighbor_dist2,
+            min_group_size=2,
+        ),
     }
     date_mae, date_spearman = date_neighbor_metrics(dates, neighbors)
     metrics["date_neighbor_mae@15"] = date_mae

@@ -38,6 +38,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot_arrows", type=int, choices=(0, 1), default=1)
     parser.add_argument("--plot_labels", type=int, choices=(0, 1), default=0)
     parser.add_argument("--arrow_scale", type=float, default=None)
+    parser.add_argument("--arrow_alpha_mode", choices=("density", "fixed"), default="density")
+    parser.add_argument("--arrow_alpha_min", type=float, default=0.05)
+    parser.add_argument("--arrow_alpha_max", type=float, default=0.65)
+    parser.add_argument(
+        "--aligned_color_mode",
+        choices=("sample", "label", "time", "fixed"),
+        default="label",
+        help="How to assign matching colors in aligned_vs_true.png",
+    )
     parser.add_argument("--knn_k", type=int, default=15)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -64,6 +73,10 @@ def main() -> int:
             plot_arrows=args.plot_arrows,
             plot_labels=args.plot_labels,
             arrow_scale=args.arrow_scale,
+            arrow_alpha_mode=args.arrow_alpha_mode,
+            arrow_alpha_min=args.arrow_alpha_min,
+            arrow_alpha_max=args.arrow_alpha_max,
+            aligned_color_mode=args.aligned_color_mode,
             knn_k=args.knn_k,
             seed=args.seed,
         )
@@ -96,4 +109,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

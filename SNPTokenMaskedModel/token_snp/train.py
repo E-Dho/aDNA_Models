@@ -57,10 +57,22 @@ class TrainConfig:
     use_group_rus: bool = False
     group_rus_mode: str = "balanced_batch"
     group_rus_max_per_group_in_batch: Optional[int] = None
+    group_rus_groups_per_batch: Optional[int] = None
     group_rus_seed: int = 42
     group_metadata_tsv: Optional[str] = None
     group_metadata_col: str = "Group ID"
     group_metadata_key: Optional[str] = None
+    use_country_loss: bool = False
+    lambda_country_loss_target: float = 0.1
+    country_loss_pos_margin: float = 0.25
+    country_loss_neg_margin: float = 1.0
+    country_loss_normalize_z: bool = True
+    country_loss_ramp_start_epoch: int = 1
+    country_loss_ramp_end_epoch: int = 10
+    country_loss_groups_per_batch: Optional[int] = None
+    country_loss_metadata_tsv: Optional[str] = None
+    country_loss_metadata_col: str = "Group ID"
+    country_loss_metadata_key: Optional[str] = None
     d_model: int = 128
     n_heads: int = 4
     local_layers: int = 2
@@ -169,15 +181,22 @@ class BalancedGroupBatchSampler:
         batch_size: int,
         seed: int,
         max_per_group_in_batch: Optional[int] = None,
+        groups_per_batch: Optional[int] = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
         if max_per_group_in_batch is not None and max_per_group_in_batch < 1:
             raise ValueError("group_rus_max_per_group_in_batch must be >= 1 when set")
+        if groups_per_batch is not None:
+            if groups_per_batch < 1:
+                raise ValueError("group_rus_groups_per_batch must be >= 1 when set")
+            if groups_per_batch > batch_size:
+                raise ValueError("group_rus_groups_per_batch must be <= batch_size")
 
         self.batch_size = int(batch_size)
         self.seed = int(seed)
         self.max_per_group_in_batch = max_per_group_in_batch
+        self.groups_per_batch = groups_per_batch
         self.group_name_by_id = dict(group_name_by_id)
 
         grouped: Dict[int, List[int]] = {}
@@ -196,12 +215,13 @@ class BalancedGroupBatchSampler:
         }
         self.active_groups = np.asarray(sorted(self.group_to_indices.keys()), dtype=np.int64)
         self.n_active_groups = int(self.active_groups.shape[0])
-        if self.max_per_group_in_batch is not None and (
-            self.n_active_groups * self.max_per_group_in_batch < self.batch_size
-        ):
+        cap_group_count = self.n_active_groups
+        if self.groups_per_batch is not None:
+            cap_group_count = min(int(self.groups_per_batch), self.n_active_groups)
+        if self.max_per_group_in_batch is not None and (cap_group_count * self.max_per_group_in_batch < self.batch_size):
             raise ValueError(
                 "group_rus_max_per_group_in_batch is too small to fill a batch: "
-                f"n_active_groups={self.n_active_groups}, cap={self.max_per_group_in_batch}, "
+                f"selected_groups={cap_group_count}, cap={self.max_per_group_in_batch}, "
                 f"batch_size={self.batch_size}"
             )
 
@@ -276,6 +296,8 @@ class BalancedGroupBatchSampler:
 
     def sample_batch(self) -> np.ndarray:
         n_groups = min(self.batch_size, self.n_active_groups)
+        if self.groups_per_batch is not None:
+            n_groups = min(int(self.groups_per_batch), self.n_active_groups, self.batch_size)
         selected_groups = self.epoch_rng.choice(self.active_groups, size=n_groups, replace=False)
         counts = self._allocate_counts(selected_groups)
 
@@ -332,6 +354,46 @@ def _masked_accuracy(logits: torch.Tensor, targets: torch.Tensor, valid_mask: to
     preds = logits.argmax(dim=-1)
     correct = (preds[valid_mask] == targets[valid_mask]).float().mean()
     return float(correct.detach().cpu().item())
+
+
+def _pairwise_country_loss(
+    z: torch.Tensor,
+    labels: torch.Tensor,
+    pos_margin: float,
+    neg_margin: float,
+    normalize_z: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    valid = labels >= 0
+    z_valid = z[valid]
+    labels_valid = labels[valid]
+    if z_valid.shape[0] < 2:
+        zero = z.sum() * 0.0
+        return zero, zero, zero, 0, 0
+
+    if normalize_z:
+        z_valid = F.normalize(z_valid, p=2, dim=-1)
+
+    dist = torch.cdist(z_valid, z_valid, p=2)
+    same = labels_valid[:, None] == labels_valid[None, :]
+    not_self = ~torch.eye(labels_valid.shape[0], dtype=torch.bool, device=labels_valid.device)
+    positive_mask = same & not_self
+    negative_mask = (~same) & not_self
+
+    positive_pairs = int(positive_mask.sum().detach().cpu().item())
+    negative_pairs = int(negative_mask.sum().detach().cpu().item())
+
+    if positive_pairs > 0:
+        positive_loss = F.relu(dist[positive_mask] - float(pos_margin)).pow(2).mean()
+    else:
+        positive_loss = z.sum() * 0.0
+
+    if negative_pairs > 0:
+        negative_loss = F.relu(float(neg_margin) - dist[negative_mask]).pow(2).mean()
+    else:
+        negative_loss = z.sum() * 0.0
+
+    total_loss = positive_loss + negative_loss
+    return total_loss, positive_loss, negative_loss, positive_pairs, negative_pairs
 
 
 class GradientReversalFunction(torch.autograd.Function):
@@ -1019,6 +1081,24 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
     )
     sample_ids = load_sample_ids(meta.sample_ids_path, meta.n_samples)
 
+    if cfg.use_country_loss:
+        if cfg.country_loss_groups_per_batch is None:
+            raise ValueError("use_country_loss=True requires country_loss_groups_per_batch to be set")
+        if cfg.country_loss_groups_per_batch < 1:
+            raise ValueError("country_loss_groups_per_batch must be >= 1")
+        if cfg.country_loss_groups_per_batch >= cfg.batch_size:
+            raise ValueError(
+                "country_loss_groups_per_batch must be < batch_size so train batches contain positive pairs"
+            )
+        if cfg.group_rus_groups_per_batch is not None and (
+            int(cfg.group_rus_groups_per_batch) != int(cfg.country_loss_groups_per_batch)
+        ):
+            raise ValueError(
+                "country_loss_groups_per_batch and group_rus_groups_per_batch must agree when both are set"
+            )
+        if not cfg.use_group_rus:
+            raise ValueError("use_country_loss=True requires use_group_rus=True for positive-pair batches")
+
     group_label_ids = None
     group_name_by_id: Dict[int, str] = {}
     group_sampler: Optional[BalancedGroupBatchSampler] = None
@@ -1054,13 +1134,48 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             batch_size=cfg.batch_size,
             seed=cfg.group_rus_seed,
             max_per_group_in_batch=cfg.group_rus_max_per_group_in_batch,
+            groups_per_batch=cfg.group_rus_groups_per_batch or cfg.country_loss_groups_per_batch,
         )
         print(
             "[INFO] group_rus "
             f"enabled=1 mode={cfg.group_rus_mode} seed={cfg.group_rus_seed} "
             f"metadata={cfg.group_metadata_tsv} key={cfg.group_metadata_key or '<first-column>'} "
             f"group_col={cfg.group_metadata_col} n_groups={len(group_name_by_id)} "
-            f"cap={cfg.group_rus_max_per_group_in_batch}"
+            f"cap={cfg.group_rus_max_per_group_in_batch} groups_per_batch="
+            f"{cfg.group_rus_groups_per_batch or cfg.country_loss_groups_per_batch or '<auto>'}"
+        )
+
+    country_label_ids_t: Optional[torch.Tensor] = None
+    country_name_by_id: Dict[int, str] = {}
+    if cfg.use_country_loss:
+        country_metadata_tsv = cfg.country_loss_metadata_tsv or cfg.group_metadata_tsv
+        if country_metadata_tsv is None:
+            raise ValueError("use_country_loss=True requires country_loss_metadata_tsv or group_metadata_tsv")
+        country_label_ids, country_name_by_id = _load_group_labels_from_metadata(
+            path=Path(country_metadata_tsv),
+            sample_ids=sample_ids,
+            group_col=cfg.country_loss_metadata_col,
+            metadata_key=cfg.country_loss_metadata_key,
+        )
+        train_country_ids = country_label_ids[splits["train"]]
+        missing_mask = train_country_ids < 0
+        if np.any(missing_mask):
+            missing_indices = splits["train"][missing_mask][:10]
+            missing_samples = [sample_ids[int(i)] for i in missing_indices]
+            raise ValueError(
+                "use_country_loss=True but some training samples have no valid country label: "
+                f"missing_count={int(missing_mask.sum())}, examples={missing_samples}"
+            )
+        country_label_ids_t = torch.from_numpy(country_label_ids.astype(np.int64, copy=False)).to(device=device)
+        print(
+            "[INFO] country_loss "
+            f"enabled=1 lambda_target={cfg.lambda_country_loss_target:.6g} "
+            f"pos_margin={cfg.country_loss_pos_margin:.6g} neg_margin={cfg.country_loss_neg_margin:.6g} "
+            f"normalize_z={int(cfg.country_loss_normalize_z)} "
+            f"ramp_start={cfg.country_loss_ramp_start_epoch} ramp_end={cfg.country_loss_ramp_end_epoch} "
+            f"metadata={country_metadata_tsv} key={cfg.country_loss_metadata_key or '<first-column>'} "
+            f"country_col={cfg.country_loss_metadata_col} n_countries={len(country_name_by_id)} "
+            f"groups_per_batch={cfg.country_loss_groups_per_batch}"
         )
 
     # Step 5: split leakage diagnostics.
@@ -1144,6 +1259,12 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             start_epoch=cfg.lambda_ramp_start_epoch,
             end_epoch=cfg.lambda_ramp_end_epoch,
         )
+        lambda_country_now = _scheduled_lambda(
+            epoch=epoch,
+            target=cfg.lambda_country_loss_target if cfg.use_country_loss else 0.0,
+            start_epoch=cfg.country_loss_ramp_start_epoch,
+            end_epoch=cfg.country_loss_ramp_end_epoch,
+        )
         train_loss_sum = 0.0
         train_masked = 0
         train_acc_sum = 0.0
@@ -1154,6 +1275,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         train_cov_pen_count = 0
         train_latent_only_aux_sum = 0.0
         train_latent_only_aux_count = 0
+        train_country_loss_sum = 0.0
+        train_positive_country_loss_sum = 0.0
+        train_negative_country_loss_sum = 0.0
+        train_country_positive_pairs_sum = 0.0
+        train_country_negative_pairs_sum = 0.0
+        train_country_loss_count = 0
+        train_positive_country_loss_count = 0
+        train_negative_country_loss_count = 0
         train_eligible_total = 0
         train_masked_total = 0
         train_orig_obs_sum = 0.0
@@ -1240,6 +1369,34 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             else:
                 adv_loss = recon_loss * 0.0
 
+            country_loss = recon_loss * 0.0
+            positive_country_loss = recon_loss * 0.0
+            negative_country_loss = recon_loss * 0.0
+            country_positive_pairs = 0
+            country_negative_pairs = 0
+            if cfg.use_country_loss:
+                if country_label_ids_t is None:
+                    raise RuntimeError("country_label_ids_t is not initialized but use_country_loss=True")
+                country_labels = country_label_ids_t[batch["sample_idx"]]
+                (
+                    country_loss,
+                    positive_country_loss,
+                    negative_country_loss,
+                    country_positive_pairs,
+                    country_negative_pairs,
+                ) = _pairwise_country_loss(
+                    z=z,
+                    labels=country_labels,
+                    pos_margin=cfg.country_loss_pos_margin,
+                    neg_margin=cfg.country_loss_neg_margin,
+                    normalize_z=cfg.country_loss_normalize_z,
+                )
+                if country_positive_pairs <= 0:
+                    raise RuntimeError(
+                        "Country loss batch has no positive pairs; set GROUP_RUS_GROUPS_PER_BATCH "
+                        "below batch_size, e.g. 3 for batch_size=6"
+                    )
+
             aux_latent_only_loss = recon_loss * 0.0
             aux_logits = out.get("aux_latent_only_logits")
             if cfg.latent_only_aux_weight > 0.0 and aux_logits is not None:
@@ -1249,6 +1406,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 recon_loss
                 + adv_loss
                 + (lambda_cov_now * cov_penalty)
+                + (lambda_country_now * country_loss)
                 + (cfg.latent_only_aux_weight * aux_latent_only_loss)
             )
 
@@ -1282,6 +1440,16 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             train_cov_pen_count += 1
             train_latent_only_aux_sum += float(aux_latent_only_loss.detach().cpu().item())
             train_latent_only_aux_count += 1
+            train_country_loss_sum += float(country_loss.detach().cpu().item())
+            if country_positive_pairs > 0:
+                train_positive_country_loss_sum += float(positive_country_loss.detach().cpu().item())
+                train_positive_country_loss_count += 1
+            if country_negative_pairs > 0:
+                train_negative_country_loss_sum += float(negative_country_loss.detach().cpu().item())
+                train_negative_country_loss_count += 1
+            train_country_positive_pairs_sum += float(country_positive_pairs)
+            train_country_negative_pairs_sum += float(country_negative_pairs)
+            train_country_loss_count += 1
             train_eligible_total += n_eligible_maskable
             train_masked_total += n_masked_positions
             train_orig_obs_sum += float(batch["orig_observed_fraction"].sum().detach().cpu().item())
@@ -1315,6 +1483,18 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         train_adv_mse = train_adv_sum / float(max(1, train_adv_count))
         train_cov_penalty = train_cov_pen_sum / float(max(1, train_cov_pen_count))
         train_latent_only_aux_ce = train_latent_only_aux_sum / float(max(1, train_latent_only_aux_count))
+        if cfg.use_country_loss:
+            train_country_loss = train_country_loss_sum / float(max(1, train_country_loss_count))
+            train_positive_country_loss = train_positive_country_loss_sum / float(max(1, train_positive_country_loss_count))
+            train_negative_country_loss = train_negative_country_loss_sum / float(max(1, train_negative_country_loss_count))
+            train_country_positive_pairs_mean = train_country_positive_pairs_sum / float(max(1, train_country_loss_count))
+            train_country_negative_pairs_mean = train_country_negative_pairs_sum / float(max(1, train_country_loss_count))
+        else:
+            train_country_loss = float("nan")
+            train_positive_country_loss = float("nan")
+            train_negative_country_loss = float("nan")
+            train_country_positive_pairs_mean = float("nan")
+            train_country_negative_pairs_mean = float("nan")
         train_masked_rate = float(train_masked_total) / float(max(1, train_eligible_total))
         orig_observed_fraction_mean = train_orig_obs_sum / float(max(1, train_equalization_count))
         equalized_observed_fraction_mean = train_equalized_obs_sum / float(max(1, train_equalization_count))
@@ -1351,6 +1531,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         val_cov_pen_count = 0
         val_latent_only_aux_sum = 0.0
         val_latent_only_aux_count = 0
+        val_country_loss_sum = 0.0
+        val_positive_country_loss_sum = 0.0
+        val_negative_country_loss_sum = 0.0
+        val_country_positive_pairs_sum = 0.0
+        val_country_negative_pairs_sum = 0.0
+        val_country_loss_count = 0
+        val_positive_country_loss_count = 0
+        val_negative_country_loss_count = 0
         val_loss_without_latent_sum = 0.0
         val_masked_without_latent = 0
         val_eligible_total = 0
@@ -1406,6 +1594,28 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 aux_logits = out.get("aux_latent_only_logits")
                 if cfg.latent_only_aux_weight > 0.0 and aux_logits is not None:
                     aux_latent_only_loss, _ = _masked_recon_ce(aux_logits, batch["targets"], valid_mask)
+                country_loss = recon_loss * 0.0
+                positive_country_loss = recon_loss * 0.0
+                negative_country_loss = recon_loss * 0.0
+                country_positive_pairs = 0
+                country_negative_pairs = 0
+                if cfg.use_country_loss:
+                    if country_label_ids_t is None:
+                        raise RuntimeError("country_label_ids_t is not initialized but use_country_loss=True")
+                    country_labels = country_label_ids_t[batch["sample_idx"]]
+                    (
+                        country_loss,
+                        positive_country_loss,
+                        negative_country_loss,
+                        country_positive_pairs,
+                        country_negative_pairs,
+                    ) = _pairwise_country_loss(
+                        z=out["window_embedding"],
+                        labels=country_labels,
+                        pos_margin=cfg.country_loss_pos_margin,
+                        neg_margin=cfg.country_loss_neg_margin,
+                        normalize_z=cfg.country_loss_normalize_z,
+                    )
                 if coverage_adversary is not None:
                     cov_pred = coverage_adversary(out["window_embedding"])
                     adv_loss = F.mse_loss(cov_pred, cov_true, reduction="mean")
@@ -1440,6 +1650,17 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 val_cov_pen_count += 1
                 val_latent_only_aux_sum += float(aux_latent_only_loss.detach().cpu().item())
                 val_latent_only_aux_count += 1
+                if cfg.use_country_loss:
+                    val_country_loss_sum += float(country_loss.detach().cpu().item())
+                    if country_positive_pairs > 0:
+                        val_positive_country_loss_sum += float(positive_country_loss.detach().cpu().item())
+                        val_positive_country_loss_count += 1
+                    if country_negative_pairs > 0:
+                        val_negative_country_loss_sum += float(negative_country_loss.detach().cpu().item())
+                        val_negative_country_loss_count += 1
+                    val_country_positive_pairs_sum += float(country_positive_pairs)
+                    val_country_negative_pairs_sum += float(country_negative_pairs)
+                    val_country_loss_count += 1
                 val_eligible_total += n_eligible_maskable
                 val_masked_total += n_masked_positions
                 val_hist.update(_counter_from_tensor(batch["targets"][batch["train_mask"] > 0.5]))
@@ -1470,6 +1691,18 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
         val_adv_mse = val_adv_sum / float(max(1, val_adv_count))
         val_cov_penalty = val_cov_pen_sum / float(max(1, val_cov_pen_count))
         val_latent_only_aux_ce = val_latent_only_aux_sum / float(max(1, val_latent_only_aux_count))
+        if cfg.use_country_loss:
+            val_country_loss = val_country_loss_sum / float(max(1, val_country_loss_count))
+            val_positive_country_loss = val_positive_country_loss_sum / float(max(1, val_positive_country_loss_count))
+            val_negative_country_loss = val_negative_country_loss_sum / float(max(1, val_negative_country_loss_count))
+            val_country_positive_pairs_mean = val_country_positive_pairs_sum / float(max(1, val_country_loss_count))
+            val_country_negative_pairs_mean = val_country_negative_pairs_sum / float(max(1, val_country_loss_count))
+        else:
+            val_country_loss = float("nan")
+            val_positive_country_loss = float("nan")
+            val_negative_country_loss = float("nan")
+            val_country_positive_pairs_mean = float("nan")
+            val_country_negative_pairs_mean = float("nan")
         val_masked_rate = float(val_masked_total) / float(max(1, val_eligible_total))
         latent_usage_gap = float(val_ce_without_latent - val_ce)
 
@@ -1530,11 +1763,22 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "val_adv_mse": float(val_adv_mse),
             "lambda_adv": float(epoch_lambda_adv if adv_enabled else 0.0),
             "lambda_cov": float(epoch_lambda_cov if cov_penalty_enabled else 0.0),
+            "lambda_country_loss": float(lambda_country_now if cfg.use_country_loss else 0.0),
             "cov_penalty": float(train_cov_penalty),
             "val_cov_penalty": float(val_cov_penalty),
             "train_latent_only_aux_ce": float(train_latent_only_aux_ce),
             "val_latent_only_aux_ce": float(val_latent_only_aux_ce),
             "latent_only_aux_weight": float(cfg.latent_only_aux_weight),
+            "train_country_loss": float(train_country_loss),
+            "train_positive_country_loss": float(train_positive_country_loss),
+            "train_negative_country_loss": float(train_negative_country_loss),
+            "train_country_positive_pairs_mean": float(train_country_positive_pairs_mean),
+            "train_country_negative_pairs_mean": float(train_country_negative_pairs_mean),
+            "val_country_loss": float(val_country_loss),
+            "val_positive_country_loss": float(val_positive_country_loss),
+            "val_negative_country_loss": float(val_negative_country_loss),
+            "val_country_positive_pairs_mean": float(val_country_positive_pairs_mean),
+            "val_country_negative_pairs_mean": float(val_country_negative_pairs_mean),
             "adv_steps_per_batch": float(max(1, int(cfg.adv_steps_per_batch))),
             "train_masked_tokens": float(train_masked),
             "val_masked_tokens": float(val_masked),
@@ -1665,6 +1909,34 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
             "seed": int(cfg.group_rus_seed),
             "metadata_tsv": cfg.group_metadata_tsv,
             "metadata_col": cfg.group_metadata_col,
+            "groups_per_batch": cfg.group_rus_groups_per_batch or cfg.country_loss_groups_per_batch,
+        },
+        "country_loss": {
+            "enabled": bool(cfg.use_country_loss),
+            "lambda_target": float(cfg.lambda_country_loss_target),
+            "pos_margin": float(cfg.country_loss_pos_margin),
+            "neg_margin": float(cfg.country_loss_neg_margin),
+            "normalize_z": bool(cfg.country_loss_normalize_z),
+            "ramp_start_epoch": int(cfg.country_loss_ramp_start_epoch),
+            "ramp_end_epoch": int(cfg.country_loss_ramp_end_epoch),
+            "metadata_tsv": cfg.country_loss_metadata_tsv or cfg.group_metadata_tsv,
+            "metadata_col": cfg.country_loss_metadata_col,
+            "groups_per_batch": cfg.country_loss_groups_per_batch,
+            "n_countries": int(len(country_name_by_id)),
+            "final_train_country_loss": float(history[-1]["train_country_loss"]) if history else float("nan"),
+            "final_val_country_loss": float(history[-1]["val_country_loss"]) if history else float("nan"),
+            "final_train_positive_country_loss": (
+                float(history[-1]["train_positive_country_loss"]) if history else float("nan")
+            ),
+            "final_train_negative_country_loss": (
+                float(history[-1]["train_negative_country_loss"]) if history else float("nan")
+            ),
+            "final_val_positive_country_loss": (
+                float(history[-1]["val_positive_country_loss"]) if history else float("nan")
+            ),
+            "final_val_negative_country_loss": (
+                float(history[-1]["val_negative_country_loss"]) if history else float("nan")
+            ),
         },
         "strong_latent_reconstruction": {
             "enabled": bool(cfg.use_strong_latent_reconstruction),
@@ -1725,6 +1997,21 @@ def run_training(cfg: TrainConfig) -> Dict[str, object]:
                 "val_latent_only_aux_ce": float(history[-1]["val_latent_only_aux_ce"]) if history else float("nan"),
                 "latent_only_aux_weight": float(cfg.latent_only_aux_weight),
                 "latent_cross_attn_residual_scale": float(cfg.latent_cross_attn_residual_scale),
+                "lambda_country_loss": float(history[-1]["lambda_country_loss"]) if history else float("nan"),
+                "train_country_loss": float(history[-1]["train_country_loss"]) if history else float("nan"),
+                "train_positive_country_loss": (
+                    float(history[-1]["train_positive_country_loss"]) if history else float("nan")
+                ),
+                "train_negative_country_loss": (
+                    float(history[-1]["train_negative_country_loss"]) if history else float("nan")
+                ),
+                "val_country_loss": float(history[-1]["val_country_loss"]) if history else float("nan"),
+                "val_positive_country_loss": (
+                    float(history[-1]["val_positive_country_loss"]) if history else float("nan")
+                ),
+                "val_negative_country_loss": (
+                    float(history[-1]["val_negative_country_loss"]) if history else float("nan")
+                ),
                 **corr_pc_metrics,
                 **{f"coverage_corr_token_{k.split('_')[-1]}": float(v) for k, v in coverage_corr_tokens.items()},
                 **probe_log,

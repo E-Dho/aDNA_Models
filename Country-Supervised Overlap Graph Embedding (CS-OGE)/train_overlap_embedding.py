@@ -14,6 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spectral_init", required=True, help="Path to spectral_init.npy")
     parser.add_argument("--sample_stats_tsv", required=True, help="Path to sample_stats.tsv")
     parser.add_argument("--output_dir", required=True, help="Output directory")
+    parser.add_argument("--objective_mode", choices=("label_supervised", "snp_similarity"), default="label_supervised")
     parser.add_argument("--latent_dim", type=int, default=6)
     parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--batch_size", type=int, default=4096)
@@ -23,10 +24,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_cov", type=float, default=0.5)
     parser.add_argument("--lambda_var", type=float, default=1.0)
     parser.add_argument("--lambda_covariance", type=float, default=0.1)
+    parser.add_argument("--lambda_graph_pos", type=float, default=1.0)
+    parser.add_argument("--lambda_graph_neg", type=float, default=1.0)
+    parser.add_argument("--lambda_graph_similarity", type=float, default=1.0)
+    parser.add_argument("--graph_similarity_temperature", type=float, default=1.0)
     parser.add_argument("--lambda_country", type=float, default=0.0)
+    parser.add_argument("--lambda_original_group", type=float, default=0.0)
     parser.add_argument("--margin", type=float, default=1.0)
     parser.add_argument("--country_margin", type=float, default=1.5)
     parser.add_argument("--country_negatives_per_anchor", type=int, default=8)
+    parser.add_argument("--original_group_negatives_per_anchor", type=int, default=4)
+    parser.add_argument("--original_group_temperature", type=float, default=1.0)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=40)
     parser.add_argument("--seed", type=int, default=42)
@@ -51,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = TrainConfig(
+        objective_mode=args.objective_mode,
         latent_dim=args.latent_dim,
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -60,10 +69,17 @@ def main() -> None:
         lambda_cov=args.lambda_cov,
         lambda_var=args.lambda_var,
         lambda_covariance=args.lambda_covariance,
+        lambda_graph_pos=args.lambda_graph_pos,
+        lambda_graph_neg=args.lambda_graph_neg,
+        lambda_graph_similarity=args.lambda_graph_similarity,
+        graph_similarity_temperature=args.graph_similarity_temperature,
         lambda_country=args.lambda_country,
+        lambda_original_group=args.lambda_original_group,
         margin=args.margin,
         country_margin=args.country_margin,
         country_negatives_per_anchor=args.country_negatives_per_anchor,
+        original_group_negatives_per_anchor=args.original_group_negatives_per_anchor,
+        original_group_temperature=args.original_group_temperature,
         val_ratio=args.val_ratio,
         patience=args.patience,
         seed=args.seed,
